@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/tls"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1173,7 +1174,7 @@ func launchStandaloneDesktopApp(url string) {
 	}
 	for _, name := range linuxEngines {
 		if binPath, err := exec.LookPath(name); err == nil {
-			args := append([]string{"--class=ProCamRadar"}, commonFlags...)
+			args := append([]string{"--ozone-platform=x11", "--class=ProCamRadar"}, commonFlags...)
 			var cmd *exec.Cmd
 			if os.Geteuid() == 0 {
 				if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
@@ -1215,6 +1216,9 @@ func cleanupAndExit() {
 	os.Exit(0)
 }
 
+//go:embed icon.png
+var embeddedIconPNG []byte
+
 const appIconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
   <rect width="100" height="100" rx="22" fill="#09090B"/>
   <path d="M50 8 L88 26 L88 54 C88 76 50 92 50 92 C50 92 12 76 12 54 L12 26 Z" fill="#18181B" stroke="#F59E0B" stroke-width="4" stroke-linejoin="round"/>
@@ -1234,8 +1238,10 @@ const uiHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProCam Radar — Инженерная система поиска и настройки IP-камер</title>
+<link rel="icon" type="image/png" sizes="256x256" href="/icon.png">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="shortcut icon" href="/favicon.svg">
+<link rel="shortcut icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
 <style>
   :root {
     --bg: #FAFAFA;
@@ -2607,13 +2613,17 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(uiHTML))
 	})
+	http.HandleFunc("/icon.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(embeddedIconPNG)
+	})
 	http.HandleFunc("/favicon.svg", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/svg+xml")
 		_, _ = w.Write([]byte(appIconSVG))
 	})
 	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/svg+xml")
-		_, _ = w.Write([]byte(appIconSVG))
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(embeddedIconPNG)
 	})
 	http.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		iface, ip, _ := getPrimaryInterface()

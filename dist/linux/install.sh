@@ -93,6 +93,21 @@ StartupWMClass=ProCamRadar
 EOF
 chmod 0644 /usr/share/applications/procam-radar.desktop
 
+for id in ProCamRadar 127.0.0.1 crx__127_0_0_1 chrome-http___127.0.0.1_8765_-Default; do
+  cat > "/usr/share/applications/${id}.desktop" << EOF
+[Desktop Entry]
+Version=4.0
+Type=Application
+Name=ProCam Radar
+Exec=/usr/local/bin/ProCamRadar_Linux_x64
+Icon=/usr/share/pixmaps/procam-radar.png
+Terminal=false
+NoDisplay=true
+StartupWMClass=${id}
+EOF
+  chmod 0644 "/usr/share/applications/${id}.desktop"
+done
+
 # 5. Обработчик двойного клика для бинарных файлов в GNOME Files (Nautilus)
 cat > /usr/local/bin/procam-run-binary << 'EOF'
 #!/usr/bin/env bash
