@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+cameras_audit_*.pdf
+cameras_audit_*.md
+snap_*.jpg
+.DS_Store

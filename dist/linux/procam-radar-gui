@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ProCam Radar v4.0 — Нативное графическое приложение инженера видеонаблюдения (Linux & Windows)
+Чистый архитектурный дизайн в стиле ProCam (#FAFAFA / #FFFFFF / #09090B / #10B981)
+Одновременная работа Кабеля (Ethernet/PoE) и Wi-Fi без потери интернета.
+"""
+
+import os
+import re
+import json
+import threading
+import subprocess
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+
+import webbrowser
+
+LAST_SCAN_CACHE = "/var/tmp/yeee_last_scan.json"
+YEEE_BIN = (
+    "/usr/local/bin/procam-radar"
+    if os.path.exists("/usr/local/bin/procam-radar")
+    else "/usr/local/bin/yeee"
+    if os.path.exists("/usr/local/bin/yeee")
+    else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "procam-radar"))
+)
+WEB_STUDIO_BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "ProCamRadar_Linux_x64"))
+ICON_CANDIDATES = [
+    "/usr/share/pixmaps/procam-radar.png",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "assets", "procam-radar-64.png")),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "assets", "procam-radar.png")),
+]
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text or "")
+
+
+def detect_network_summary() -> str:
+    """Определяет состояние Кабеля (Ethernet) и Wi-Fi для отображения в шапке."""
+    wired = []
+    wifi = []
+    try:
+        out = subprocess.check_output(["ip", "-o", "-4", "addr", "show", "up"], text=True, timeout=1.5)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split(":")[0]
+            if ifname == "lo" or ifname.startswith(("docker", "br-", "veth", "virbr", "tun", "tap")):
+                continue
+            cidr = parts[3]
+            is_wireless = os.path.exists(f"/sys/class/net/{ifname}/wireless") or ifname.startswith(("wl", "wlan", "wifi"))
+            if is_wireless:
+                wifi.append(f"{ifname} ({cidr})")
+            else:
+                wired.append(f"{ifname} ({cidr})")
+    except Exception:
+        pass
+
+    if not wired:
+        try:
+            for ifname in os.listdir("/sys/class/net"):
+                if ifname == "lo" or ifname.startswith(("wl", "wlan", "docker", "br-", "veth", "virbr")):
+                    continue
+                carrier_path = f"/sys/class/net/{ifname}/carrier"
+                if os.path.exists(carrier_path):
+                    with open(carrier_path, "r") as f:
+                        if f.read().strip() == "1":
+                            wired.append(f"{ifname} (L2 без IP)")
+        except Exception:
+            pass
+
+    w_str = f"Кабель: {', '.join(wired)}" if wired else "Кабель: не подключен"
+    wf_str = f"Wi-Fi: {', '.join(wifi)}" if wifi else "Wi-Fi: откл."
+    return f"● {w_str}   |   {wf_str}   (Маршрутизация /32 активна)"
+
+
+class ProCamRadarGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ProCam Radar v4.0 — Поиск, диагностика и настройка IP-камер")
+        self.geometry("1340x840")
+        self.minsize(1100, 700)
+        self.configure(bg="#FAFAFA")
+
+        for ic_path in ICON_CANDIDATES:
+            if os.path.exists(ic_path):
+                try:
+                    self._app_icon = tk.PhotoImage(file=ic_path)
+                    self.iconphoto(True, self._app_icon)
+                    break
+                except Exception:
+                    pass
+
+        self.running_task = False
+        self.cameras = []
+
+        self._setup_styles()
+        self._build_ui()
+        self._load_cached_cameras()
+        self._refresh_net_status()
+
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure("TFrame", background="#FAFAFA")
+        style.configure(
+            "TLabel",
+            background="#FAFAFA",
+            foreground="#09090B",
+            font=("DejaVu Sans", 10),
+        )
+        style.configure(
+            "Treeview",
+            background="#FFFFFF",
+            foreground="#09090B",
+            fieldbackground="#FFFFFF",
+            borderwidth=0,
+            rowheight=32,
+            font=("DejaVu Sans", 9),
+        )
+        style.configure(
+            "Treeview.Heading",
+            background="#FAFAFA",
+            foreground="#52525B",
+            relief="flat",
+            font=("DejaVu Sans", 9, "bold"),
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", "#09090B")],
+            foreground=[("selected", "#FFFFFF")],
+        )
+
+    def _make_btn(self, parent, text, command, variant="default"):
+        if variant == "dark":
+            bg, fg, abg, border = "#09090B", "#FFFFFF", "#27272A", "#09090B"
+            font_spec = ("DejaVu Sans", 9, "bold")
+        elif variant == "outline-dark":
+            bg, fg, abg, border = "#FFFFFF", "#09090B", "#F4F4F5", "#09090B"
+            font_spec = ("DejaVu Sans", 9, "bold")
+        else:
+            bg, fg, abg, border = "#FFFFFF", "#18181B", "#F4F4F5", "#E4E4E7"
+            font_spec = ("DejaVu Sans", 9)
+
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=abg,
+            activeforeground=fg,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=border,
+            font=font_spec,
+            padx=14,
+            pady=7,
+            cursor="hand2",
+        )
+        return btn
+
+    def _draw_cyber_owl(self, canvas: tk.Canvas):
+        """Рисует точную копию логотипа CyberOwlMark из ProCam (Logo.tsx)."""
+        canvas.delete("all")
+        # Badge (#09090B)
+        canvas.create_rectangle(2, 2, 42, 42, fill="#09090B", outline="#09090B")
+        # Owl Shield (#18181B with #E4E4E7 stroke)
+        canvas.create_polygon(
+            8, 10, 15, 14, 22, 9, 29, 14, 36, 10, 37, 23, 30, 35, 22, 38, 14, 35, 7, 23,
+            fill="#18181B", outline="#E4E4E7", width=1.4
+        )
+        # V-Brow Crest
+        canvas.create_line(9, 14, 22, 21, 35, 14, fill="#FFFFFF", width=1.6)
+        # Left 4K Camera Lens Eye
+        canvas.create_oval(10, 18, 20, 28, fill="#09090B", outline="#FFFFFF", width=1.4)
+        canvas.create_oval(13, 21, 17, 25, fill="#09090B", outline="#10B981", width=1.2)
+        # Right 4K Camera Lens Eye
+        canvas.create_oval(24, 18, 34, 28, fill="#09090B", outline="#FFFFFF", width=1.4)
+        canvas.create_oval(27, 21, 31, 25, fill="#09090B", outline="#10B981", width=1.2)
+        # Beak
+        canvas.create_polygon(22, 25, 19, 30, 22, 34, 25, 30, fill="#E4E4E7", outline="")
+
+    def _build_ui(self):
+        # 1. Светлая архитектурная шапка ProCam (#FFFFFF с границей #E4E4E7)
+        header_frame = tk.Frame(
+            self, bg="#FFFFFF", padx=20, pady=12, highlightthickness=1, highlightbackground="#E4E4E7"
+        )
+        header_frame.pack(fill=tk.X)
+
+        brand_box = tk.Frame(header_frame, bg="#FFFFFF")
+        brand_box.pack(side=tk.LEFT)
+
+        owl_canvas = tk.Canvas(brand_box, width=44, height=44, bg="#FFFFFF", highlightthickness=0)
+        owl_canvas.pack(side=tk.LEFT, padx=(0, 10))
+        self._draw_cyber_owl(owl_canvas)
+
+        title_col = tk.Frame(brand_box, bg="#FFFFFF")
+        title_col.pack(side=tk.LEFT)
+        title_row = tk.Frame(title_col, bg="#FFFFFF")
+        title_row.pack(anchor=tk.W)
+        tk.Label(
+            title_row,
+            text="PRO",
+            bg="#FFFFFF",
+            fg="#09090B",
+            font=("DejaVu Sans", 15, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            title_row,
+            text="CAM",
+            bg="#FFFFFF",
+            fg="#52525B",
+            font=("DejaVu Sans", 15),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            title_row,
+            text="  RADAR v4.0",
+            bg="#09090B",
+            fg="#FFFFFF",
+            font=("DejaVu Sans Mono", 8, "bold"),
+            padx=6,
+            pady=2,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.net_lbl = tk.Label(
+            title_col,
+            text="Проверка сетевых интерфейсов Кабель + Wi-Fi...",
+            bg="#FFFFFF",
+            fg="#059669",
+            font=("DejaVu Sans Mono", 8, "bold"),
+        )
+        self.net_lbl.pack(anchor=tk.W, pady=(3, 0))
+
+        right_header = tk.Frame(header_frame, bg="#FFFFFF")
+        right_header.pack(side=tk.RIGHT)
+
+        if os.path.exists(WEB_STUDIO_BIN):
+            self._make_btn(
+                right_header,
+                "Открыть графическую студию",
+                self.action_open_web_studio,
+                variant="outline-dark",
+            ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.status_lbl = tk.Label(
+            right_header,
+            text="● Готов к работе",
+            bg="#FAFAFA",
+            fg="#09090B",
+            font=("DejaVu Sans", 9, "bold"),
+            highlightthickness=1,
+            highlightbackground="#E4E4E7",
+            padx=12,
+            pady=6,
+        )
+        self.status_lbl.pack(side=tk.RIGHT)
+
+        # 2. Главная панель команд с понятными названиями
+        top_bar = tk.Frame(self, bg="#FAFAFA", padx=20, pady=12)
+        top_bar.pack(fill=tk.X)
+
+        self._make_btn(
+            top_bar, "Найти камеры в сети", self.action_radar_scan, variant="dark"
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self._make_btn(
+            top_bar, "Поиск по кабелю (Отключи → Включи)", self.action_interactive_capture, variant="outline-dark"
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            top_bar, "Проверить конфликты IP", self.action_conflict_scan
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            top_bar, "Пакетная активация", self.action_activate_dialog
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            top_bar, "Скачать PDF-отчет", self.action_dump_pdf
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            top_bar, "Инструкция (PDF)", self.action_open_manual
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            top_bar, "Очистить временные сети", self.action_clean
+        ).pack(side=tk.RIGHT)
+
+        # 3. Карточка подбора свободных IP-адресов (с выбором количества!)
+        free_frame = tk.Frame(
+            self,
+            bg="#FFFFFF",
+            padx=16,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground="#E4E4E7",
+        )
+        free_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+
+        tk.Label(
+            free_frame,
+            text="Подбор свободных IP-адресов:",
+            bg="#FFFFFF",
+            fg="#09090B",
+            font=("DejaVu Sans", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Label(
+            free_frame,
+            text="Сколько нужно IP:",
+            bg="#FFFFFF",
+            fg="#52525B",
+            font=("DejaVu Sans", 9),
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self.free_count_var = tk.StringVar(value="8")
+        self.free_spin = tk.Spinbox(
+            free_frame,
+            from_=1,
+            to=245,
+            textvariable=self.free_count_var,
+            width=5,
+            bg="#FAFAFA",
+            fg="#09090B",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#E4E4E7",
+            font=("DejaVu Sans Mono", 10, "bold"),
+        )
+        self.free_spin.pack(side=tk.LEFT, padx=(0, 8), ipady=3)
+
+        for preset in (1, 4, 8, 16, 32, 64):
+            btn_p = tk.Button(
+                free_frame,
+                text=f"{preset} IP",
+                command=lambda n=preset: self._set_free_count_and_run(n),
+                bg="#FAFAFA",
+                fg="#09090B",
+                activebackground="#09090B",
+                activeforeground="#FFFFFF",
+                relief=tk.FLAT,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#E4E4E7",
+                font=("DejaVu Sans Mono", 8, "bold"),
+                padx=8,
+                pady=4,
+                cursor="hand2",
+            )
+            btn_p.pack(side=tk.LEFT, padx=2)
+
+        tk.Label(
+            free_frame,
+            text="   Подсеть (пусто = авто):",
+            bg="#FFFFFF",
+            fg="#52525B",
+            font=("DejaVu Sans", 9),
+        ).pack(side=tk.LEFT, padx=(8, 4))
+
+        self.free_subnet_entry = tk.Entry(
+            free_frame,
+            width=16,
+            bg="#FAFAFA",
+            fg="#09090B",
+            insertbackground="#09090B",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#E4E4E7",
+            font=("DejaVu Sans Mono", 9),
+        )
+        self.free_subnet_entry.pack(side=tk.LEFT, padx=(0, 10), ipady=4)
+
+        self._make_btn(
+            free_frame, "Подобрать свободные IP", self.action_free_ips, variant="dark"
+        ).pack(side=tk.LEFT, padx=4)
+
+        # 4. Таблица найденных камер
+        table_frame = tk.Frame(
+            self, bg="#FFFFFF", highlightthickness=1, highlightbackground="#E4E4E7"
+        )
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 10))
+
+        cols = ("zone", "iface", "ip", "mac", "vendor", "model", "serial", "ports", "subnet")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=11)
+        headings = {
+            "zone": "Статус сети",
+            "iface": "Интерфейс",
+            "ip": "IP-адрес",
+            "mac": "MAC-адрес",
+            "vendor": "Производитель",
+            "model": "Модель камеры",
+            "serial": "Серийный номер",
+            "ports": "Порты",
+            "subnet": "Маршрут / Подсеть",
+        }
+        widths = {
+            "zone": 120,
+            "iface": 95,
+            "ip": 120,
+            "mac": 140,
+            "vendor": 150,
+            "model": 155,
+            "serial": 130,
+            "ports": 105,
+            "subnet": 195,
+        }
+        for c in cols:
+            self.tree.heading(c, text=headings[c])
+            self.tree.column(c, width=widths[c], anchor=tk.W)
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        # 5. Панель управления выбранной камерой (#FFFFFF с акцентной рамкой #09090B)
+        ctrl_frame = tk.Frame(
+            self,
+            bg="#FFFFFF",
+            padx=16,
+            pady=12,
+            highlightthickness=1,
+            highlightbackground="#09090B",
+        )
+        ctrl_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+
+        tk.Label(
+            ctrl_frame, text="IP камеры:", bg="#FFFFFF", fg="#09090B", font=("DejaVu Sans", 9, "bold")
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        self.ip_entry = tk.Entry(
+            ctrl_frame,
+            width=14,
+            bg="#FAFAFA",
+            fg="#09090B",
+            insertbackground="#09090B",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#E4E4E7",
+            font=("DejaVu Sans Mono", 10, "bold"),
+        )
+        self.ip_entry.pack(side=tk.LEFT, padx=(0, 10), ipady=4)
+        self.ip_entry.insert(0, "192.168.1.64")
+
+        tk.Label(
+            ctrl_frame, text="MAC:", bg="#FFFFFF", fg="#09090B", font=("DejaVu Sans", 9, "bold")
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        self.mac_entry = tk.Entry(
+            ctrl_frame,
+            width=17,
+            bg="#FAFAFA",
+            fg="#09090B",
+            insertbackground="#09090B",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#E4E4E7",
+            font=("DejaVu Sans Mono", 10),
+        )
+        self.mac_entry.pack(side=tk.LEFT, padx=(0, 10), ipady=4)
+
+        self._make_btn(
+            ctrl_frame, "Открыть по MAC (при конфликте)", self.action_open_isolated, variant="dark"
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            ctrl_frame, "Открыть в браузере", self.action_open_web, variant="outline-dark"
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            ctrl_frame, "Смотреть видео (RTSP)", self.action_play_rtsp
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            ctrl_frame, "Сделать снимок", self.action_snap
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            ctrl_frame, "Паспорт камеры", self.action_info
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            ctrl_frame, "Проверка кабеля и PoE", self.action_cable_test
+        ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(
+            ctrl_frame, "Изменить IP-адрес", self.action_set_ip_dialog
+        ).pack(side=tk.LEFT, padx=3)
+
+        # 6. Чистая карточка результатов диагностики (вместо терминала)
+        log_frame = tk.Frame(
+            self, bg="#FFFFFF", highlightthickness=1, highlightbackground="#E4E4E7"
+        )
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 16))
+
+        self.log_text = tk.Text(
+            log_frame,
+            height=8,
+            bg="#FFFFFF",
+            fg="#18181B",
+            insertbackground="#09090B",
+            font=("DejaVu Sans Mono", 9),
+            relief=tk.FLAT,
+            padx=14,
+            pady=10,
+        )
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.append_log(
+            "ProCam Radar v4.0 готов к работе.\n"
+            "• Нажмите «Найти камеры в сети» для одновременного поиска по Кабелю и Wi-Fi.\n"
+            "• При работе с камерами в чужих подсетях интернет по Wi-Fi не отключается (/32 маршрутизация).\n"
+        )
+
+    def _refresh_net_status(self):
+        try:
+            self.net_lbl.configure(text=detect_network_summary())
+        except Exception:
+            pass
+        self.after(6000, self._refresh_net_status)
+
+    def append_log(self, msg: str):
+        clean_msg = strip_ansi(msg)
+        self.log_text.insert(tk.END, clean_msg)
+        self.log_text.see(tk.END)
+
+    def _set_busy(self, busy: bool, label: str = ""):
+        self.running_task = busy
+        if busy:
+            self.status_lbl.configure(text=f"⏳ {label}...", fg="#059669")
+        else:
+            self.status_lbl.configure(text="● Готов к работе", fg="#09090B")
+
+    def _on_tree_select(self, _event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        vals = self.tree.item(sel[0], "values")
+        if len(vals) >= 4:
+            self.ip_entry.delete(0, tk.END)
+            self.ip_entry.insert(0, vals[2])
+            self.mac_entry.delete(0, tk.END)
+            self.mac_entry.insert(0, vals[3])
+
+    def _load_cached_cameras(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        if not os.path.exists(LAST_SCAN_CACHE):
+            return
+        try:
+            with open(LAST_SCAN_CACHE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.cameras = data.get("cameras", [])
+            for cam in self.cameras:
+                if cam.get("conflict"):
+                    zone = "Конфликт IP"
+                elif cam.get("is_local_subnet", True):
+                    zone = "Своя сеть"
+                else:
+                    zone = "Чужая подсеть"
+                iface_s = cam.get("iface") or data.get("interface") or "auto"
+                ports_s = ", ".join(str(p) for p in cam.get("open_ports", [])) or "L2"
+                sub_s = cam.get("subnet_info", {}).get("status", "-")
+                self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        zone,
+                        iface_s,
+                        cam.get("ip", "-"),
+                        cam.get("mac_upper") or cam.get("mac", "-").upper(),
+                        cam.get("vendor_resolved") or cam.get("vendor", "-"),
+                        cam.get("model", "-"),
+                        cam.get("serial", "-"),
+                        ports_s,
+                        sub_s,
+                    ),
+                )
+        except Exception as exc:
+            self.append_log(f"Ошибка чтения кэша: {exc}\n")
+
+    def _run_yeee_async(self, args: list, task_title: str, reload_table: bool = False, on_done=None):
+        if self.running_task:
+            messagebox.showinfo("Выполняется", "Дождитесь завершения текущей операции.")
+            return
+        self._set_busy(True, task_title)
+        cmd = [YEEE_BIN] + args
+        self.append_log(f"\n━━━ {task_title} ━━━\n")
+
+        def worker():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for line in proc.stdout:
+                    self.after(0, self.append_log, line)
+                proc.wait()
+            except Exception as exc:
+                self.after(0, self.append_log, f"Ошибка: {exc}\n")
+            finally:
+                def finish():
+                    self._set_busy(False)
+                    if reload_table:
+                        self._load_cached_cameras()
+                    if on_done:
+                        on_done()
+                self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def action_open_web_studio(self):
+        if os.path.exists(WEB_STUDIO_BIN):
+            subprocess.Popen([WEB_STUDIO_BIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.append_log("Открыта графическая студия ProCam Radar.\n")
+
+    def action_radar_scan(self):
+        self._run_yeee_async(["scan"], "Поиск камер в сети", reload_table=True)
+
+    def action_interactive_capture(self):
+        self.append_log("\nОтключите патч-корд камеры на 3 секунды и подключите обратно.\n")
+        self._run_yeee_async([], "Поиск по кабелю (Отключи → Включи)", reload_table=True)
+
+    def action_conflict_scan(self):
+        self._run_yeee_async(["conflict"], "Проверка конфликтов IP", reload_table=False)
+
+    def _set_free_count_and_run(self, count: int):
+        self.free_count_var.set(str(count))
+        self.action_free_ips()
+
+    def action_free_ips(self):
+        raw_cnt = self.free_count_var.get().strip()
+        try:
+            cnt = max(1, min(245, int(raw_cnt)))
+        except ValueError:
+            cnt = 8
+            self.free_count_var.set("8")
+        args = ["free", str(cnt)]
+        sub = self.free_subnet_entry.get().strip()
+        if sub:
+            args.extend(["--subnet", sub])
+        self._run_yeee_async(args, f"Подбор {cnt} свободных IP", reload_table=False)
+
+    def action_clean(self):
+        self._run_yeee_async(["clean"], "Очистка временных сетей", reload_table=False)
+
+    def action_dump_pdf(self):
+        self._run_yeee_async(["dump", "pdf"], "Создание PDF-отчета", reload_table=False)
+
+    def action_open_manual(self):
+        def _open_man():
+            man_path = "/home/yerniyaz/Desktop/projects/yeee-cam/PROCAM_RADAR_MANUAL_RU.pdf"
+            if os.path.exists(man_path):
+                subprocess.Popen(["xdg-open", man_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._run_yeee_async(["manual"], "Генерация PDF-инструкции", on_done=_open_man)
+
+    def action_open_web(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            return
+        self._run_yeee_async(["open", ip], f"Открытие в браузере {ip}")
+
+    def action_open_isolated(self):
+        ip = self.ip_entry.get().strip()
+        mac = self.mac_entry.get().strip()
+        if not ip or not mac:
+            messagebox.showwarning("Укажите IP и MAC", "Выберите камеру в таблице или укажите IP и MAC.")
+            return
+        self._run_yeee_async(["open", ip, "--mac", mac], f"Открытие по MAC {mac}")
+
+    def action_play_rtsp(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            return
+        creds = simpledialog.askstring(
+            "Смотреть видео (RTSP)",
+            f"Логин:пароль для камеры {ip}:",
+            initialvalue="admin:admin",
+            parent=self,
+        )
+        if creds is None:
+            return
+        parts = creds.split(":", 1)
+        u = parts[0] if parts else "admin"
+        p = parts[1] if len(parts) > 1 else ""
+        self._run_yeee_async(["play", ip, u, p], f"Видеопоток RTSP {ip}")
+
+    def action_snap(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            return
+        self._run_yeee_async(["snap", ip], f"Снимок с камеры {ip}")
+
+    def action_info(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            return
+        self._run_yeee_async(["info", ip], f"Паспорт камеры {ip}")
+
+    def action_cable_test(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            return
+        self._run_yeee_async(["cable", ip], f"Проверка кабеля и PoE {ip}")
+
+    def action_activate_dialog(self):
+        new_pass = simpledialog.askstring(
+            "Пакетная активация камер",
+            "Введите новый пароль для активации камер (от 8 символов):",
+            parent=self,
+        )
+        if not new_pass:
+            return
+        start_ip = simpledialog.askstring(
+            "Начальный IP-адрес",
+            "С какого IP начать выдачу адресов (или оставьте пустым):",
+            parent=self,
+        )
+        args = ["activate", new_pass]
+        if start_ip and start_ip.strip():
+            args.append(start_ip.strip())
+        self._run_yeee_async(args, "Пакетная активация")
+
+    def action_set_ip_dialog(self):
+        old_ip = self.ip_entry.get().strip()
+        mac = self.mac_entry.get().strip()
+        if not old_ip:
+            return
+        new_ip = simpledialog.askstring("Изменить IP-адрес", f"Текущий IP: {old_ip}\nВведите новый IP-адрес:", parent=self)
+        if not new_ip:
+            return
+        creds = simpledialog.askstring(
+            "Авторизация камеры",
+            "Логин:пароль (оставьте пустым для авто-подбора):",
+            initialvalue="",
+            parent=self,
+        )
+        args = ["set-ip", old_ip, new_ip.strip()]
+        if creds and ":" in creds:
+            u, p = creds.split(":", 1)
+            args.extend([u, p])
+        if mac:
+            args.extend(["--mac", mac])
+        self._run_yeee_async(args, f"Смена IP {old_ip} → {new_ip.strip()}")
+
+
+if __name__ == "__main__":
+    app = ProCamRadarGUI()
+    app.mainloop()

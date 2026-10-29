@@ -1,0 +1,3753 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+yeee v2.0 (Field Engineer Edition) — Глобальная утилита обнаружения, диагностики и управления IP-камерами
+Возможности:
+  - Baseline-калибровка ARP и эфира с фильтрацией MAC-префиксов камер (OUI)
+  - Интерактивный режим «Отключи и подключи камеру» (перехват Gratuitous ARP / DAD / Gateway ARP)
+  - Активная L2-провокация через Scapy sendp (ONVIF WS-Discovery + Hikvision SADP + Dahua DHIP + ARP)
+  - Глубокий парсинг L2 XML/SOAP/JSON ответов (Модель, Серийный номер, Версия прошивки)
+  - Безопасная инъекция вторичной подсети (ip addr add ... label <iface>:yeee) без разрыва связи с роутером
+  - Активный детектор IP-конфликтов (yeee conflict)
+  - Экспорт инженерных отчетов аудита в Markdown с правами $SUDO_USER (yeee dump)
+  - Безопасный GUI-мост из-под sudo (yeee open <IP>)
+  - Пакетная смена IP через Hikvision ISAPI / Dahua CGI / ONVIF (yeee set-ip)
+"""
+
+import os
+import re
+import ssl
+import pwd
+import sys
+import json
+import time
+import uuid
+import socket
+import signal
+import shutil
+import urllib.parse
+import ipaddress
+import threading
+import subprocess
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+# ==============================================================================
+# АВТО-ПОВЫШЕНИЕ ПРИВИЛЕГИЙ (Self-Elevation через sudo NOPASSWD с сохранением GUI-окружения)
+# ==============================================================================
+if os.geteuid() != 0:
+    target_bin = "/usr/local/bin/yeee" if os.path.exists("/usr/local/bin/yeee") else os.path.abspath(sys.argv[0])
+    preserve_vars = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+    env_args = []
+    for var in preserve_vars:
+        val = os.environ.get(var)
+        if val:
+            env_args.append(f"--preserve-env={var}")
+    try:
+        os.execvp("sudo", ["sudo"] + env_args + [target_bin] + sys.argv[1:])
+    except Exception as exc:
+        sys.stderr.write(f"\033[91m[ОШИБКА] Не удалось повысить привилегии через sudo: {exc}\033[0m\n")
+        sys.exit(1)
+
+# Подавляем лишние предупреждения Scapy при импорте
+import logging
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+logging.getLogger("scapy").setLevel(logging.ERROR)
+
+try:
+    from scapy.all import (
+        Ether,
+        ARP,
+        IP,
+        UDP,
+        Raw,
+        sendp,
+        srp,
+        sniff,
+        conf,
+    )
+    conf.verb = 0
+except ImportError:
+    sys.stderr.write("\033[91m[ОШИБКА] Модуль python3-scapy не установлен. Установите: sudo apt install python3-scapy\033[0m\n")
+    sys.exit(1)
+
+try:
+    import requests
+    from requests.auth import HTTPDigestAuth, HTTPBasicAuth
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    requests = None
+
+
+# ==============================================================================
+# КОНСТАНТЫ И ЦВЕТОВОЕ ОФОРМЛЕНИЕ ТЕРМИНАЛА
+# ==============================================================================
+VERSION = "4.0.0 ProCam Radar (Engineering Suite)"
+LAST_SCAN_CACHE = "/var/tmp/yeee_last_scan.json"
+
+
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+
+
+# ==============================================================================
+# БАЗА MAC-ПРЕФИКСОВ (OUI) ПРОИЗВОДИТЕЛЕЙ IP-КАМЕР
+# Устройства с этими префиксами НИКОГДА не попадают в baseline_ignore
+# ==============================================================================
+CAMERA_OUI_MAP = {
+    # Hikvision / HiWatch / Ezviz
+    "04:ee:cd": "Hikvision / HiWatch",
+    "08:3a:2f": "Hikvision / HiWatch",
+    "08:54:11": "Hikvision / HiWatch",
+    "08:a1:89": "Hikvision / HiWatch",
+    "08:cc:81": "Hikvision / HiWatch",
+    "10:12:fb": "Hikvision / HiWatch",
+    "14:2f:fd": "Hikvision / HiWatch",
+    "18:68:cb": "Hikvision / HiWatch",
+    "18:80:25": "Hikvision / HiWatch",
+    "24:0f:9b": "Hikvision / HiWatch",
+    "24:28:fd": "Hikvision / HiWatch",
+    "24:32:ae": "Hikvision / HiWatch",
+    "24:48:45": "Hikvision / HiWatch",
+    "28:57:be": "Hikvision / HiWatch",
+    "2c:a5:9c": "Hikvision / HiWatch",
+    "34:09:62": "Hikvision / HiWatch",
+    "3c:1b:f8": "Hikvision / HiWatch",
+    "40:ac:bf": "Hikvision / HiWatch",
+    "44:19:b6": "Hikvision / HiWatch",
+    "44:47:cc": "Hikvision / HiWatch",
+    "44:a6:42": "Hikvision / HiWatch",
+    "4c:1f:86": "Hikvision / HiWatch",
+    "4c:62:df": "Hikvision / HiWatch",
+    "4c:bd:8f": "Hikvision / HiWatch",
+    "4c:f5:dc": "Hikvision / HiWatch",
+    "50:e5:38": "Hikvision / HiWatch",
+    "54:8c:81": "Hikvision / HiWatch",
+    "54:c4:15": "Hikvision / HiWatch",
+    "58:03:fb": "Hikvision / HiWatch",
+    "58:50:ed": "Hikvision / HiWatch",
+    "5c:34:5b": "Hikvision / HiWatch",
+    "64:db:8b": "Hikvision / HiWatch",
+    "68:6d:bc": "Hikvision / HiWatch",
+    "74:3f:c2": "Hikvision / HiWatch",
+    "80:48:9f": "Hikvision / HiWatch",
+    "80:7c:62": "Hikvision / HiWatch",
+    "80:be:af": "Hikvision / HiWatch",
+    "80:f5:ae": "Hikvision / HiWatch",
+    "84:94:59": "Hikvision / HiWatch",
+    "84:9a:40": "Hikvision / HiWatch",
+    "88:de:39": "Hikvision / HiWatch",
+    "8c:e7:48": "Hikvision / HiWatch",
+    "94:e1:ac": "Hikvision / HiWatch",
+    "98:8b:0a": "Hikvision / HiWatch",
+    "98:9d:e5": "Hikvision / HiWatch",
+    "98:df:82": "Hikvision / HiWatch",
+    "9c:f6:dd": "Hikvision / HiWatch",
+    "a0:ff:0c": "Hikvision / HiWatch",
+    "a4:14:37": "Hikvision / HiWatch",
+    "a4:29:02": "Hikvision / HiWatch",
+    "a4:4b:d5": "Hikvision / HiWatch",
+    "a4:a4:59": "Hikvision / HiWatch",
+    "a4:d5:c2": "Hikvision / HiWatch",
+    "ac:b9:2f": "Hikvision / HiWatch",
+    "ac:cb:51": "Hikvision / HiWatch",
+    "b4:a3:82": "Hikvision / HiWatch",
+    "bc:5e:33": "Hikvision / HiWatch",
+    "bc:9b:5e": "Hikvision / HiWatch",
+    "bc:ad:28": "Hikvision / HiWatch",
+    "bc:ba:c2": "Hikvision / HiWatch",
+    "c0:51:7e": "Hikvision / HiWatch",
+    "c0:56:e3": "Hikvision / HiWatch",
+    "c0:6d:ed": "Hikvision / HiWatch",
+    "c4:2f:90": "Hikvision / HiWatch",
+    "c8:02:8f": "Hikvision / HiWatch",
+    "cc:8c:bf": "Hikvision / HiWatch",
+    "d4:e8:53": "Hikvision / HiWatch",
+    "dc:07:f8": "Hikvision / HiWatch",
+    "dc:d2:6a": "Hikvision / HiWatch",
+    "e0:ba:ad": "Hikvision / HiWatch",
+    "e0:ca:3c": "Hikvision / HiWatch",
+    "e0:df:13": "Hikvision / HiWatch",
+    "e4:d5:8b": "Hikvision / HiWatch",
+    "e8:a0:ed": "Hikvision / HiWatch",
+    "ec:a9:71": "Hikvision / HiWatch",
+    "ec:c8:9c": "Hikvision / HiWatch",
+    "f8:4d:fc": "Hikvision / HiWatch",
+    "fc:9f:fd": "Hikvision / HiWatch",
+
+    # Dahua / Imou
+    "00:12:41": "Dahua",
+    "08:ed:ed": "Dahua",
+    "14:a7:8b": "Dahua",
+    "18:2a:7b": "Dahua",
+    "20:51:32": "Dahua",
+    "24:52:6a": "Dahua",
+    "2c:f0:5d": "Dahua",
+    "30:dd:aa": "Dahua",
+    "38:af:29": "Dahua",
+    "3c:ef:8c": "Dahua",
+    "40:f4:13": "Dahua",
+    "4c:11:bf": "Dahua",
+    "50:f6:1a": "Dahua",
+    "5c:a6:e6": "Dahua",
+    "5c:f2:07": "Dahua",
+    "64:f2:fb": "Dahua",
+    "6c:1c:71": "Dahua",
+    "70:c9:76": "Dahua",
+    "74:a7:8e": "Dahua",
+    "78:45:58": "Dahua",
+    "84:e9:84": "Dahua",
+    "8c:e9:b4": "Dahua",
+    "90:02:a9": "Dahua",
+    "98:f9:c7": "Dahua",
+    "9c:14:63": "Dahua",
+    "a0:bd:1d": "Dahua",
+    "a8:60:b6": "Dahua",
+    "ac:1a:3d": "Dahua",
+    "b0:60:88": "Dahua",
+    "b4:4c:3b": "Dahua",
+    "bc:32:5f": "Dahua",
+    "c0:39:5a": "Dahua",
+    "c4:aa:c4": "Dahua",
+    "cc:79:cf": "Dahua",
+    "d4:43:0e": "Dahua",
+    "e0:2a:82": "Dahua",
+    "e0:50:8b": "Dahua",
+    "e4:24:6c": "Dahua",
+    "ec:71:db": "Dahua",
+    "f0:41:c8": "Dahua",
+    "f4:b1:c2": "Dahua",
+    "f8:ce:07": "Dahua",
+    "fc:5f:49": "Dahua",
+
+    # Tiandy
+    "00:1c:27": "Tiandy",
+    "00:50:c2": "Tiandy",
+    "18:68:82": "Tiandy",
+    "30:49:50": "Tiandy",
+    "40:6a:8e": "Tiandy",
+    "6c:5c:3d": "Tiandy",
+    "70:66:55": "Tiandy",
+    "84:5d:d7": "Tiandy",
+    "9c:41:7c": "Tiandy",
+    "c4:34:6b": "Tiandy",
+    "d8:76:0a": "Tiandy",
+    "e8:61:1f": "Tiandy",
+
+    # Uniview (UNV) / Xiongmai (XM) / Axis / Vivotek / Hanwha
+    "48:ea:63": "Uniview (UNV)",
+    "6c:f1:7e": "Uniview (UNV)",
+    "80:22:75": "Uniview (UNV)",
+    "c4:79:05": "Uniview (UNV)",
+    "00:12:12": "Xiongmai (XM)",
+    "00:18:ae": "Xiongmai (XM)",
+    "00:40:8c": "Axis",
+    "ac:cc:8e": "Axis",
+    "b8:a4:4f": "Axis",
+    "00:02:d1": "Vivotek",
+    "00:0f:7c": "ACTi",
+}
+
+
+def get_camera_vendor(mac: str) -> str:
+    """Возвращает бренд камеры по MAC-префиксу (OUI) или пустую строку."""
+    if not mac:
+        return ""
+    prefix = mac.strip().lower()[:8]
+    return CAMERA_OUI_MAP.get(prefix, "")
+
+
+def is_camera_mac(mac: str) -> bool:
+    """Проверяет, принадлежит ли MAC-адрес известному производителю камер."""
+    return bool(get_camera_vendor(mac))
+
+
+# ==============================================================================
+# РАБОТА С СЕТЕВЫМИ ИНТЕРФЕЙСАМИ И ПОДСИСТЕМОЙ IPROUTE2
+# ==============================================================================
+def run_cmd(cmd: list) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def get_carrier(iface: str) -> bool:
+    """Читает физический статус линка /sys/class/net/<iface>/carrier."""
+    carrier_path = f"/sys/class/net/{iface}/carrier"
+    try:
+        with open(carrier_path, "r") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def ensure_iface_up(iface: str) -> None:
+    """Поднимает интерфейс административно (ip link set <iface> up) для детекта carrier."""
+    try:
+        flags_path = f"/sys/class/net/{iface}/flags"
+        if os.path.exists(flags_path):
+            with open(flags_path, "r") as f:
+                flags = int(f.read().strip(), 16)
+            if not (flags & 0x1):  # IFF_UP
+                run_cmd(["ip", "link", "set", iface, "up"])
+                time.sleep(0.3)
+    except Exception:
+        pass
+
+
+def get_iface_mac(iface: str) -> str:
+    """Возвращает MAC-адрес интерфейса."""
+    try:
+        with open(f"/sys/class/net/{iface}/address", "r") as f:
+            return f.read().strip().lower()
+    except OSError:
+        return "00:00:00:00:00:00"
+
+
+def get_iface_ipv4_list(iface: str) -> list:
+    """
+    Возвращает список словарей: [{'ip': '192.168.0.10', 'prefix': 24, 'cidr': '192.168.0.10/24', 'label': 'wlp4s0'}]
+    Использует JSON-вывод iproute2 (`ip -j -4 addr show dev <iface>`).
+    """
+    res = run_cmd(["ip", "-j", "-4", "addr", "show", "dev", iface])
+    addrs = []
+    if res.returncode == 0 and res.stdout.strip():
+        try:
+            data = json.loads(res.stdout)
+            for iface_obj in data:
+                for info in iface_obj.get("addr_info", []):
+                    if info.get("family") == "inet" and "local" in info and "prefixlen" in info:
+                        ip_str = info["local"]
+                        prefix = int(info["prefixlen"])
+                        label = info.get("label", iface)
+                        addrs.append({
+                            "ip": ip_str,
+                            "prefix": prefix,
+                            "cidr": f"{ip_str}/{prefix}",
+                            "label": label,
+                        })
+            return addrs
+        except Exception:
+            pass
+    return addrs
+
+
+def get_all_local_macs_and_ips() -> tuple:
+    """Собирает все собственные MAC и IPv4 адреса ноутбука, чтобы не ловить свои же пакеты."""
+    local_macs = set()
+    local_ips = {"127.0.0.1", "0.0.0.0"}
+    try:
+        for iface in os.listdir("/sys/class/net"):
+            mac = get_iface_mac(iface)
+            if mac and mac != "00:00:00:00:00:00":
+                local_macs.add(mac)
+            for item in get_iface_ipv4_list(iface):
+                local_ips.add(item["ip"])
+    except Exception:
+        pass
+    return local_macs, local_ips
+
+
+def discover_interfaces() -> tuple:
+    """
+    Автовыбор сетевого интерфейса:
+    - Приоритет физическому проводному интерфейсу (eth*, enp*, eno*, ens*, enx*).
+    - Если проводной кабель не подключен (carrier == 0), используется активный Wi-Fi (wlan*, wlp*).
+    Возвращает: (selected_iface, is_wired, all_wired_ifaces, all_wifi_ifaces)
+    """
+    try:
+        net_ifaces = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        net_ifaces = []
+
+    wired_ifaces = []
+    wifi_ifaces = []
+
+    for iface in net_ifaces:
+        if iface == "lo" or iface.startswith(("docker", "veth", "br-", "virbr", "tailscale", "tun", "tap", "wg")):
+            continue
+        is_wireless = os.path.isdir(f"/sys/class/net/{iface}/wireless") or os.path.isdir(f"/sys/class/net/{iface}/phy80211")
+        if iface.startswith(("wlan", "wlp", "wlx")) or is_wireless:
+            wifi_ifaces.append(iface)
+        elif iface.startswith(("eth", "enp", "eno", "ens", "enx")):
+            wired_ifaces.append(iface)
+
+    # Проверяем физические проводные интерфейсы
+    for w_iface in wired_ifaces:
+        ensure_iface_up(w_iface)
+        if get_carrier(w_iface):
+            return w_iface, True, wired_ifaces, wifi_ifaces
+
+    # Если кабель не подключен — ищем активный Wi-Fi интерфейс
+    for wf_iface in wifi_ifaces:
+        ensure_iface_up(wf_iface)
+        if get_carrier(wf_iface):
+            return wf_iface, False, wired_ifaces, wifi_ifaces
+
+    # Если Wi-Fi не подключен, но есть проводной интерфейс — выбираем проводной (ожидание линка)
+    if wired_ifaces:
+        return wired_ifaces[0], True, wired_ifaces, wifi_ifaces
+    if wifi_ifaces:
+        return wifi_ifaces[0], False, wired_ifaces, wifi_ifaces
+
+    raise RuntimeError("Не найдено ни одного подходящего проводного (eth*/enp*/eno*) или Wi-Fi (wlan*/wlp*) интерфейса.")
+
+
+# ==============================================================================
+# УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЬСКИМ КОНТЕКСТОМ ($SUDO_USER) И БЕЗОПАСНЫЙ GUI-ВРАППЕР
+# ==============================================================================
+def get_sudo_user_info() -> dict:
+    """Возвращает информацию о реальном пользователе, вызвавшем утилиту (SUDO_USER)."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user or sudo_user == "root":
+        # Пытаемся определить по владельцу текущего рабочего каталога или UID 1000
+        try:
+            cwd_stat = os.stat(os.getcwd())
+            if cwd_stat.st_uid != 0:
+                pw = pwd.getpwuid(cwd_stat.st_uid)
+                sudo_user = pw.pw_name
+        except Exception:
+            pass
+    if not sudo_user or sudo_user == "root":
+        try:
+            pw = pwd.getpwuid(1000)
+            sudo_user = pw.pw_name
+        except Exception:
+            sudo_user = "root"
+
+    try:
+        pw = pwd.getpwnam(sudo_user)
+        return {
+            "user": pw.pw_name,
+            "uid": pw.pw_uid,
+            "gid": pw.pw_gid,
+            "home": pw.pw_dir,
+        }
+    except KeyError:
+        return {"user": "root", "uid": 0, "gid": 0, "home": "/root"}
+
+
+def chown_to_sudo_user(filepath: str) -> str:
+    """Меняет владельца файла с root на $SUDO_USER."""
+    uinfo = get_sudo_user_info()
+    try:
+        os.chown(filepath, uinfo["uid"], uinfo["gid"])
+    except Exception:
+        pass
+    return uinfo["user"]
+
+
+def run_gui_as_sudo_user(cmd_args: list) -> bool:
+    """
+    Безопасный враппер запуска GUI-приложений (xdg-open, браузер, плеер) из-под sudo
+    от имени обычного пользователя ($SUDO_USER) с сохранением DISPLAY, WAYLAND_DISPLAY и XAUTHORITY.
+    """
+    uinfo = get_sudo_user_info()
+    uid = uinfo["uid"]
+    user = uinfo["user"]
+    home = uinfo["home"]
+
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+    display = os.environ.get("DISPLAY") or ":0"
+    wayland_display = os.environ.get("WAYLAND_DISPLAY") or ""
+    if not wayland_display and os.path.exists(f"{runtime_dir}/wayland-0"):
+        wayland_display = "wayland-0"
+
+    xauthority = os.environ.get("XAUTHORITY") or ""
+    if not xauthority:
+        cand_xauth = os.path.join(home, ".Xauthority")
+        if os.path.exists(cand_xauth):
+            xauthority = cand_xauth
+
+    dbus_addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or ""
+    if not dbus_addr and os.path.exists(f"{runtime_dir}/bus"):
+        dbus_addr = f"unix:path={runtime_dir}/bus"
+
+    env_kv = [
+        f"HOME={home}",
+        f"USER={user}",
+        f"LOGNAME={user}",
+        f"DISPLAY={display}",
+        f"XDG_RUNTIME_DIR={runtime_dir}",
+        f"PATH={os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}",
+    ]
+    if wayland_display:
+        env_kv.append(f"WAYLAND_DISPLAY={wayland_display}")
+    if xauthority:
+        env_kv.append(f"XAUTHORITY={xauthority}")
+    if dbus_addr:
+        env_kv.append(f"DBUS_SESSION_BUS_ADDRESS={dbus_addr}")
+
+    full_cmd = ["sudo", "-u", user, "env"] + env_kv + cmd_args
+    try:
+        subprocess.Popen(
+            full_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as exc:
+        print(f"{C.RED}[ОШИБКА GUI-ВРАППЕРА] Не удалось запустить {cmd_args}: {exc}{C.RESET}")
+        return False
+
+
+# ==============================================================================
+# КОМАНДА CLEAN: ОЧИСТКА ВРЕМЕННЫХ ПОДСЕТЕЙ (*:yeee) И ТОЧЕЧНЫХ МАРШРУТОВ
+# ==============================================================================
+def clean_yeee_subnets() -> int:
+    print(f"{C.CYAN}{C.BOLD}[PROCAM RADAR · ОЧИСТКА СЕТЕЙ]{C.RESET} Поиск и удаление временных подсетей (label *:yeee)...")
+    res = run_cmd(["ip", "-j", "-4", "addr", "show"])
+    if res.returncode != 0:
+        print(f"{C.RED}[ОШИБКА] Не удалось получить список IP-адресов.{C.RESET}")
+        return 1
+
+    removed = []
+    alias_ips = set()
+    try:
+        data = json.loads(res.stdout)
+    except Exception:
+        data = []
+
+    for iface_obj in data:
+        iface = iface_obj.get("ifname", "")
+        for info in iface_obj.get("addr_info", []):
+            label = info.get("label", "")
+            if label.endswith(":yeee"):
+                local_ip = info["local"]
+                alias_ips.add(local_ip)
+                cidr = f"{local_ip}/{info['prefixlen']}"
+                del_res = run_cmd(["ip", "addr", "del", cidr, "dev", iface])
+                if del_res.returncode == 0:
+                    removed.append((iface, cidr, label))
+                    print(f"  {C.GREEN}✔ Удален алиас:{C.RESET} {C.BOLD}{cidr}{C.RESET} на {iface} ({label})")
+                else:
+                    print(f"  {C.RED}✖ Ошибка удаления {cidr} на {iface}: {del_res.stderr.strip()}{C.RESET}")
+
+    # Очищаем точечные /32 маршруты, созданные при совпадении подсети Wi-Fi и Ethernet
+    route_res = run_cmd(["ip", "-j", "-4", "route", "show"])
+    if route_res.returncode == 0 and route_res.stdout.strip():
+        try:
+            routes = json.loads(route_res.stdout)
+            for r in routes:
+                prefsrc = r.get("prefsrc", "")
+                dst = r.get("dst", "")
+                dev = r.get("dev", "")
+                if prefsrc in alias_ips and dst and dst != "default":
+                    run_cmd(["ip", "route", "del", dst, "dev", dev])
+        except Exception:
+            pass
+
+    if not removed:
+        print(f"  {C.GREEN}✔ Активных временных подсетей (*:yeee) не обнаружено. Основная сеть Wi-Fi/роутера в порядке.{C.RESET}")
+    else:
+        print(f"{C.GREEN}{C.BOLD}[ГОТОВО]{C.RESET} Удалено временных подсетей: {len(removed)}. Интернет и связь с роутером сохранены.")
+    return 0
+
+
+# ==============================================================================
+# ЭТАП 1: КАЛИБРОВКА СЕТИ РОУТЕРА (BASELINE)
+# ==============================================================================
+def calibrate_baseline(iface: str, local_macs: set, local_ips: set) -> tuple:
+    """
+    Читает /proc/net/arp и слушает эфир 2 секунды.
+    Собирает baseline_macs и baseline_ips, ИСКЛЮЧАЯ из игнора MAC-префиксы камер.
+    """
+    print(f"\n{C.BLUE}{C.BOLD}[ЭТАП 1/5] Калибровка сети (Baseline) на интерфейсе {iface}...{C.RESET}")
+    baseline_macs = set(local_macs)
+    baseline_ips = set(local_ips)
+    skipped_cameras = []
+
+    iface_nets = []
+    for item in get_iface_ipv4_list(iface):
+        if not item["label"].endswith(":yeee"):
+            try:
+                iface_nets.append(ipaddress.IPv4Network(f"{item['ip']}/{item['prefix']}", strict=False))
+            except ValueError:
+                pass
+
+    def is_in_local_subnet(ip_str: str) -> bool:
+        if not iface_nets:
+            return False
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_str)
+            return any(ip_obj in net for net in iface_nets)
+        except ValueError:
+            return False
+
+    # 1. Читаем /proc/net/arp
+    try:
+        with open("/proc/net/arp", "r") as f:
+            lines = f.read().splitlines()[1:]
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 6:
+                ip_addr, hw_type, flags, mac_addr, mask, dev = parts[:6]
+                mac_addr = mac_addr.lower()
+                if mac_addr == "00:00:00:00:00:00" or flags == "0x0":
+                    continue
+                if is_camera_mac(mac_addr):
+                    skipped_cameras.append((ip_addr, mac_addr, get_camera_vendor(mac_addr)))
+                    continue
+                if is_in_local_subnet(ip_addr):
+                    baseline_macs.add(mac_addr)
+                    baseline_ips.add(ip_addr)
+    except Exception as exc:
+        print(f"  {C.YELLOW}[!] Предупреждение при чтении /proc/net/arp: {exc}{C.RESET}")
+
+    # 2. Слушаем эфир 2 секунды для фиксации активных узлов роутера
+    print(f"  {C.DIM}Прослушивание эфира (2 сек) для фиксации фоновых устройств роутера...{C.RESET}")
+
+    def _baseline_pkt_handler(pkt):
+        if not pkt.haslayer(Ether):
+            return
+        src_mac = pkt[Ether].src.lower()
+        if src_mac in local_macs or src_mac == "ff:ff:ff:ff:ff:ff":
+            return
+        if is_camera_mac(src_mac):
+            return
+        src_ip = None
+        if pkt.haslayer(ARP):
+            src_ip = pkt[ARP].psrc
+        elif pkt.haslayer(IP):
+            src_ip = pkt[IP].src
+
+        if src_ip and src_ip not in ("0.0.0.0", "255.255.255.255") and is_in_local_subnet(src_ip):
+            baseline_macs.add(src_mac)
+            baseline_ips.add(src_ip)
+
+    try:
+        sniff(iface=iface, timeout=2.0, store=False, prn=_baseline_pkt_handler)
+    except Exception:
+        pass
+
+    ignored_count = max(0, len(baseline_macs) - len(local_macs))
+    print(f"  {C.GREEN}✔ В baseline_ignore добавлено фоновых узлов сети:{C.RESET} {ignored_count}")
+    if skipped_cameras:
+        for c_ip, c_mac, c_vendor in skipped_cameras:
+            print(f"  {C.YELLOW}★ Камера в ARP исключена из игнора:{C.RESET} {c_ip} ({c_mac} — {c_vendor})")
+
+    return baseline_macs, baseline_ips
+
+
+# ==============================================================================
+# ЭТАП 3: АКТИВНАЯ L2-ПРОВОКАЦИЯ И ГЛУБОКИЙ ПАРСИНГ МЕТАДАННЫХ (SADP / ONVIF / DHIP)
+# ==============================================================================
+def build_onvif_probe() -> bytes:
+    msg_id = f"uuid:{uuid.uuid4()}"
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+        'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
+        'xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+        "<e:Header>"
+        f"<w:MessageID>{msg_id}</w:MessageID>"
+        '<w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
+        '<w:Action a:mustUnderstand="true" xmlns:a="http://www.w3.org/2005/08/addressing">'
+        "http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>"
+        "</e:Header>"
+        "<e:Body>"
+        "<d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe>"
+        "</e:Body>"
+        "</e:Envelope>"
+    )
+    return xml.encode("utf-8")
+
+
+def build_sadp_probe() -> bytes:
+    probe_uuid = str(uuid.uuid4()).upper()
+    xml = f'<?xml version="1.0" encoding="utf-8"?><Probe><Uuid>{probe_uuid}</Uuid><Types>inquiry</Types></Probe>'
+    return xml.encode("utf-8")
+
+
+def build_dahua_probe() -> bytes:
+    body = b'{"method":"DHDiscover.search","params":{"mac":"","uni":1}}\r\n'
+    header = (
+        b"\x20\x00\x00\x00" + b"DHIP" + b"\x00" * 12
+        + len(body).to_bytes(4, "little")
+        + b"\x00" * 4
+        + len(body).to_bytes(4, "little")
+        + b"\x00" * 4
+    )
+    return header + body
+
+
+def send_l2_provocations(iface: str, probe_src_ips: set) -> None:
+    """
+    Отправляет сырые L2-фреймы через Scapy sendp:
+      а) ONVIF WS-Discovery XML Probe на 239.255.255.250:3702
+      б) Hikvision SADP XML Probe на 239.255.255.250:37020 и 255.255.255.255:37020
+      в) Dahua DHIP Probe и точечные L2 ARP-запросы к заводским IP камер
+    """
+    if not get_carrier(iface):
+        return
+
+    src_mac = get_iface_mac(iface)
+    ipv4_list = get_iface_ipv4_list(iface)
+    src_ip = ipv4_list[0]["ip"] if ipv4_list else "192.168.1.250"
+    probe_src_ips.add(src_ip)
+
+    onvif_payload = build_onvif_probe()
+    sadp_payload = build_sadp_probe()
+    dahua_payload = build_dahua_probe()
+
+    frames = [
+        # a) ONVIF WS-Discovery XML Probe -> 239.255.255.250:3702 (Multicast + Broadcast)
+        Ether(src=src_mac, dst="01:00:5e:7f:ff:fa")
+        / IP(src=src_ip, dst="239.255.255.250", ttl=4)
+        / UDP(sport=3702, dport=3702)
+        / Raw(load=onvif_payload),
+        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
+        / IP(src=src_ip, dst="239.255.255.250", ttl=4)
+        / UDP(sport=3702, dport=3702)
+        / Raw(load=onvif_payload),
+
+        # б) Hikvision SADP XML Probe -> 239.255.255.250:37020 и 255.255.255.255:37020
+        Ether(src=src_mac, dst="01:00:5e:7f:ff:fa")
+        / IP(src=src_ip, dst="239.255.255.250", ttl=4)
+        / UDP(sport=37020, dport=37020)
+        / Raw(load=sadp_payload),
+        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
+        / IP(src=src_ip, dst="255.255.255.255", ttl=4)
+        / UDP(sport=37020, dport=37020)
+        / Raw(load=sadp_payload),
+
+        # в) Dahua ConfigTool Discovery -> 239.255.255.251:37810 и 255.255.255.255:37810
+        Ether(src=src_mac, dst="01:00:5e:7f:ff:fb")
+        / IP(src=src_ip, dst="239.255.255.251", ttl=4)
+        / UDP(sport=37810, dport=37810)
+        / Raw(load=dahua_payload),
+        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
+        / IP(src=src_ip, dst="255.255.255.255", ttl=4)
+        / UDP(sport=37810, dport=37810)
+        / Raw(load=dahua_payload),
+    ]
+
+    default_camera_targets = [
+        ("192.168.1.250", "192.168.1.64"),
+        ("192.168.1.250", "192.168.1.108"),
+        ("192.168.1.250", "192.168.1.100"),
+        ("192.168.1.250", "192.168.1.2"),
+        ("192.168.1.250", "192.168.1.10"),
+        ("192.168.0.250", "192.168.0.64"),
+        ("192.168.0.250", "192.168.0.108"),
+        ("192.168.0.250", "192.168.0.120"),
+    ]
+    for p_src, p_dst in default_camera_targets:
+        probe_src_ips.add(p_src)
+        frames.append(
+            Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
+            / ARP(op=1, hwsrc=src_mac, psrc=p_src, hwdst="00:00:00:00:00:00", pdst=p_dst)
+        )
+
+    try:
+        sendp(frames, iface=iface, verbose=False)
+    except Exception:
+        pass
+
+
+def parse_xml_discovery_payload(raw_bytes: bytes) -> dict:
+    """
+    Глубокий парсер L2 UDP-ответов (agent_04_diag):
+      - Hikvision SADP (порт 37020): IPv4Address, DeviceDescription/DeviceType, DeviceSN, SoftwareVersion/DSPVersion
+      - ONVIF WS-Discovery (порт 3702): XAddrs, Types, Scopes (hardware/model/name, serial, firmware/version)
+      - Dahua DHIP (порт 37810): IPAddress, DeviceType/MachineName, SerialNo, Version
+    """
+    info = {}
+    try:
+        text = raw_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return info
+
+    # 1. Hikvision SADP XML
+    m_sadp_ip = re.search(r"<IPv4Address>\s*(\d+\.\d+\.\d+\.\d+)\s*</IPv4Address>", text, re.I)
+    if m_sadp_ip:
+        info["ip"] = m_sadp_ip.group(1)
+        info["vendor"] = "Hikvision / HiWatch (SADP)"
+
+    m_sadp_desc = re.search(r"<DeviceDescription>\s*([^<]+)\s*</DeviceDescription>", text, re.I)
+    m_sadp_type = re.search(r"<DeviceType>\s*([^<]+)\s*</DeviceType>", text, re.I)
+    if m_sadp_desc:
+        info["model"] = m_sadp_desc.group(1).strip()
+    elif m_sadp_type:
+        info["model"] = m_sadp_type.group(1).strip()
+
+    m_sadp_sn = re.search(r"<(?:DeviceSN|SerialNumber)>\s*([^<]+)\s*</(?:DeviceSN|SerialNumber)>", text, re.I)
+    if m_sadp_sn:
+        info["serial"] = m_sadp_sn.group(1).strip()
+
+    m_sadp_fw = re.search(r"<SoftwareVersion>\s*([^<]+)\s*</SoftwareVersion>", text, re.I)
+    m_sadp_dsp = re.search(r"<DSPVersion>\s*([^<]+)\s*</DSPVersion>", text, re.I)
+    if m_sadp_fw:
+        fw_str = m_sadp_fw.group(1).strip()
+        if m_sadp_dsp:
+            fw_str += f" (DSP: {m_sadp_dsp.group(1).strip()})"
+        info["firmware"] = fw_str
+
+    # 2. ONVIF WS-Discovery SOAP/XML
+    if "ProbeMatches" in text or "XAddrs" in text or "Scopes" in text:
+        m_onvif_ip = re.search(r"https?://(\d+\.\d+\.\d+\.\d+)", text, re.I)
+        if m_onvif_ip and "ip" not in info:
+            info["ip"] = m_onvif_ip.group(1)
+
+        m_types = re.search(r"<(?:\w+:)?Types>\s*([^<]+)\s*</(?:\w+:)?Types>", text, re.I)
+        types_val = m_types.group(1).strip() if m_types else ""
+
+        m_scopes = re.search(r"<(?:\w+:)?Scopes>\s*([^<]+)\s*</(?:\w+:)?Scopes>", text, re.I)
+        if m_scopes:
+            scopes_raw = urllib.parse.unquote(m_scopes.group(1).strip())
+            m_hw = re.search(r"onvif://www\.onvif\.org/(?:hardware|Model)/([^\s]+)", scopes_raw, re.I)
+            m_name = re.search(r"onvif://www\.onvif\.org/name/([^\s]+)", scopes_raw, re.I)
+            if m_hw and "model" not in info:
+                info["model"] = m_hw.group(1).strip()
+            elif m_name and "model" not in info:
+                info["model"] = m_name.group(1).strip()
+
+            m_sn = re.search(r"onvif://www\.onvif\.org/(?:serial|serialnumber)/([^\s]+)", scopes_raw, re.I)
+            if m_sn and "serial" not in info:
+                info["serial"] = m_sn.group(1).strip()
+
+            m_fw = re.search(r"onvif://www\.onvif\.org/(?:firmware|version|software)/([^\s]+)", scopes_raw, re.I)
+            if m_fw and "firmware" not in info:
+                info["firmware"] = m_fw.group(1).strip()
+
+        if "model" not in info and types_val:
+            info["model"] = types_val
+
+        if "vendor" not in info:
+            low = text.lower()
+            if "hikvision" in low or "hiwatch" in low:
+                info["vendor"] = "Hikvision / HiWatch (ONVIF)"
+            elif "dahua" in low or "imou" in low:
+                info["vendor"] = "Dahua (ONVIF)"
+            elif "tiandy" in low:
+                info["vendor"] = "Tiandy (ONVIF)"
+            elif "uniview" in low or "unv" in low:
+                info["vendor"] = "Uniview (ONVIF)"
+            else:
+                info["vendor"] = "ONVIF IP Camera"
+
+    # 3. Dahua DHIP JSON
+    if "DHDiscover" in text or '"DeviceType"' in text or '"SerialNo"' in text:
+        m_dh_ip = re.search(r'"IPv4Address"\s*:\s*\{[^}]*"IPAddress"\s*:\s*"(\d+\.\d+\.\d+\.\d+)"', text)
+        if m_dh_ip and "ip" not in info:
+            info["ip"] = m_dh_ip.group(1)
+        m_dh_model = re.search(r'"DeviceType"\s*:\s*"([^"]+)"', text)
+        if m_dh_model and "model" not in info:
+            info["model"] = m_dh_model.group(1).strip()
+        m_dh_sn = re.search(r'"SerialNo"\s*:\s*"([^"]+)"', text)
+        if m_dh_sn and "serial" not in info:
+            info["serial"] = m_dh_sn.group(1).strip()
+        m_dh_fw = re.search(r'"Version"\s*:\s*"([^"]+)"', text)
+        if m_dh_fw and "firmware" not in info:
+            info["firmware"] = m_dh_fw.group(1).strip()
+        if "vendor" not in info:
+            info["vendor"] = "Dahua (DHIP)"
+
+    return info
+
+
+# ==============================================================================
+# ЭТАП 4: ИНЪЕКЦИЯ ВТОРИЧНОЙ ПОДСЕТИ БЕЗ РАЗРЫВА СВЯЗИ С РОУТЕРОМ И WI-FI
+# ==============================================================================
+def get_other_ifaces_subnets(target_iface: str) -> list:
+    """
+    Возвращает список (other_iface, IPv4Network, other_ip) всех остальных активных интерфейсов
+    (например, Wi-Fi), чтобы при одновременном подключении Wi-Fi и Ethernet не перебить маршрут роутера.
+    """
+    other_nets = []
+    try:
+        for ifname in os.listdir("/sys/class/net"):
+            if ifname == target_iface or ifname == "lo":
+                continue
+            for item in get_iface_ipv4_list(ifname):
+                if item["label"].endswith(":yeee"):
+                    continue
+                try:
+                    net = ipaddress.IPv4Network(f"{item['ip']}/{item['prefix']}", strict=False)
+                    other_nets.append((ifname, net, item["ip"]))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return other_nets
+
+
+def inject_subnet_alias(iface: str, camera_ip: str) -> dict:
+    """
+    Безопасный мост к камере при одновременной работе Wi-Fi и кабеля Ethernet:
+    1. Если камера уже в родной подсети этого же интерфейса — ничего не меняет.
+    2. Если подсеть камеры совпадает с подсетью ДРУГОГО интерфейса (например, Wi-Fi уже в 192.168.1.0/24,
+       а камера 192.168.1.64 подключена кабелем в Ethernet) — добавляет /32 адрес и точечный маршрут /32
+       только до IP камеры через кабель, чтобы НЕ оборвать Wi-Fi и интернет!
+    3. Если подсеть камеры чужая для всех интерфейсов — добавляет /24 алиас с меткой <iface>:yeee.
+    """
+    try:
+        cam_ip_obj = ipaddress.IPv4Address(camera_ip)
+    except ValueError:
+        return {"injected": False, "status": "Некорректный IPv4", "alias_ip": None}
+
+    if cam_ip_obj.is_unspecified or cam_ip_obj.is_multicast or cam_ip_obj.is_loopback:
+        return {"injected": False, "status": "Служебный IP (мост не требуется)", "alias_ip": None}
+
+    octets = camera_ip.split(".")
+    prefix_24 = f"{octets[0]}.{octets[1]}.{octets[2]}"
+
+    # Проверяем, не конфликтует ли подсеть камеры с другим активным интерфейсом (например, Wi-Fi)
+    other_nets = get_other_ifaces_subnets(iface)
+    overlapping_other = None
+    used_other_ips = set()
+    for other_if, other_net, other_ip in other_nets:
+        used_other_ips.add(other_ip)
+        if cam_ip_obj in other_net:
+            overlapping_other = (other_if, other_net, other_ip)
+
+    existing_addrs = get_iface_ipv4_list(iface)
+    for item in existing_addrs:
+        try:
+            net = ipaddress.IPv4Network(f"{item['ip']}/{item['prefix']}", strict=False)
+            if cam_ip_obj in net and not overlapping_other:
+                if item["label"].endswith(":yeee"):
+                    return {
+                        "injected": True,
+                        "status": f"Мост активен ({item['cidr']} на {iface})",
+                        "alias_ip": item["ip"],
+                    }
+                return {
+                    "injected": False,
+                    "status": f"Родная сеть ({item['cidr']} на {iface})",
+                    "alias_ip": item["ip"],
+                }
+        except ValueError:
+            pass
+
+    candidate_ip = f"{prefix_24}.250"
+    if octets[3] == "250" or candidate_ip in used_other_ips:
+        candidate_ip = f"{prefix_24}.249"
+    if octets[3] == "249" or candidate_ip in used_other_ips:
+        candidate_ip = f"{prefix_24}.248"
+
+    label = f"{iface}:yeee"
+    if len(label) > 15:
+        label = f"{iface[:10]}:yeee"
+
+    # Случай, когда одновременно активны Wi-Fi и Кабель в одной и той же подсети /24:
+    # создаем /32 алиас + точечный /32 маршрут на камеру, сохраняя весь остальной трафик и интернет на Wi-Fi!
+    if overlapping_other:
+        other_if, other_net, _ = overlapping_other
+        cidr_32 = f"{candidate_ip}/32"
+        run_cmd(["ip", "addr", "add", cidr_32, "dev", iface, "label", label])
+        rt_res = run_cmd(["ip", "route", "replace", f"{camera_ip}/32", "dev", iface, "src", candidate_ip, "scope", "link"])
+        if rt_res.returncode == 0:
+            return {
+                "injected": True,
+                "status": f"Точечный мост {camera_ip}/32 через {iface} (Wi-Fi {other_if} сохранен)",
+                "alias_ip": candidate_ip,
+            }
+
+    cidr = f"{candidate_ip}/24"
+    cmd = ["ip", "addr", "add", cidr, "brd", "+", "dev", iface, "label", label]
+    res = run_cmd(cmd)
+    if res.returncode == 0 or "File exists" in res.stderr:
+        return {
+            "injected": True,
+            "status": f"Мост {cidr} ({iface})",
+            "alias_ip": candidate_ip,
+        }
+    else:
+        return {
+            "injected": False,
+            "status": f"Ошибка моста {cidr}: {res.stderr.strip()}",
+            "alias_ip": None,
+        }
+
+
+# ==============================================================================
+# ЭТАП 5: ПРОВЕРКА ПОРТОВ, ВЫДАЧА КАРТОЧКИ И КЭШИРОВАНИЕ ДЛЯ DUMP
+# ==============================================================================
+TARGET_PORTS = [80, 443, 8000, 554, 37777]
+
+
+def check_single_port(ip: str, port: int, timeout: float = 0.8) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def scan_camera_ports(ip: str) -> list:
+    if not ip or ip == "0.0.0.0":
+        return []
+    open_ports = []
+    with ThreadPoolExecutor(max_workers=len(TARGET_PORTS)) as executor:
+        futures = {port: executor.submit(check_single_port, ip, port) for port in TARGET_PORTS}
+        for port in TARGET_PORTS:
+            if futures[port].result():
+                open_ports.append(port)
+    return open_ports
+
+
+def build_rtsp_link(ip: str, vendor: str, open_ports: list) -> str:
+    v_low = (vendor or "").lower()
+    if "hikvision" in v_low or "hiwatch" in v_low or 8000 in open_ports:
+        return f"rtsp://admin:password@{ip}:554/Streaming/Channels/101"
+    if "dahua" in v_low or 37777 in open_ports:
+        return f"rtsp://admin:password@{ip}:554/cam/realmonitor?channel=1&subtype=0"
+    if "tiandy" in v_low:
+        return f"rtsp://admin:password@{ip}:554/1/1"
+    return f"rtsp://admin:password@{ip}:554/stream1"
+
+
+def enrich_camera_record(cam: dict) -> dict:
+    """Формирует финальные поля карточки (бренд, ссылки, метаданные) для вывода и сохранения в dump."""
+    ip = cam.get("ip", "0.0.0.0")
+    mac = cam.get("mac", "00:00:00:00:00:00").upper()
+    vendor = cam.get("vendor") or get_camera_vendor(cam.get("mac", "")) or "Неизвестный бренд (New Node)"
+    open_ports = cam.get("open_ports", [])
+
+    if "Неизвестный" in vendor or vendor == "ONVIF IP Camera":
+        if 8000 in open_ports:
+            vendor = f"{vendor} [Hikvision SDK :8000]"
+        elif 37777 in open_ports:
+            vendor = f"{vendor} [Dahua SDK :37777]"
+
+    if 443 in open_ports and 80 not in open_ports:
+        web_link = f"https://{ip}"
+    else:
+        web_link = f"http://{ip}"
+
+    rtsp_link = build_rtsp_link(ip, vendor, open_ports)
+
+    cam["mac_upper"] = mac
+    cam["vendor_resolved"] = vendor
+    cam["model"] = cam.get("model") or "Н/Д (не передано в L2)"
+    cam["serial"] = cam.get("serial") or "Н/Д"
+    cam["firmware"] = cam.get("firmware") or "Н/Д"
+    cam["web_link"] = web_link
+    cam["rtsp_link"] = rtsp_link
+    return cam
+
+
+def print_camera_card(idx: int, cam: dict) -> None:
+    enrich_camera_record(cam)
+    ip = cam["ip"]
+    mac = cam["mac_upper"]
+    vendor = cam["vendor_resolved"]
+    model = cam["model"]
+    serial = cam["serial"]
+    firmware = cam["firmware"]
+    open_ports = cam.get("open_ports", [])
+    subnet_info = cam.get("subnet_info", {})
+    web_link = cam["web_link"]
+    rtsp_link = cam["rtsp_link"]
+    ports_str = ", ".join(str(p) for p in open_ports) if open_ports else "Нет открытых из [80, 443, 8000, 554, 37777]"
+
+    border = "═" * 66
+    print(f"\n{C.GREEN}{C.BOLD}╔{border}╗{C.RESET}")
+    print(f"{C.GREEN}{C.BOLD}║  🎥 ОБНАРУЖЕНА КАМЕРА #{idx:<42}║{C.RESET}")
+    print(f"{C.GREEN}{C.BOLD}╠{border}╣{C.RESET}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}IP-адрес       :{C.RESET} {C.CYAN}{C.BOLD}{ip}{C.RESET}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}MAC-адрес      :{C.RESET} {C.YELLOW}{mac}{C.RESET}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Бренд (OUI/L2) :{C.RESET} {C.MAGENTA}{C.BOLD}{vendor}{C.RESET}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Модель         :{C.RESET} {C.WHITE}{model}{C.RESET}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Серийный номер :{C.RESET} {serial}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Версия прошивки:{C.RESET} {firmware}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Интерфейс      :{C.RESET} {cam.get('iface', '-')}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Статус подсети :{C.RESET} {subnet_info.get('status', '-')}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Открытые порты :{C.RESET} {ports_str}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}Веб-интерфейс  :{C.RESET} {C.BLUE}{C.BOLD}{web_link}{C.RESET}")
+    if 443 in open_ports and 80 in open_ports:
+        print(f"{C.GREEN}║{C.RESET}  {C.BOLD}HTTPS-ссылка   :{C.RESET} {C.BLUE}https://{ip}{C.RESET}")
+    print(f"{C.GREEN}║{C.RESET}  {C.BOLD}RTSP-поток     :{C.RESET} {C.CYAN}{rtsp_link}{C.RESET}")
+    print(f"{C.GREEN}{C.BOLD}╚{border}╝{C.RESET}")
+
+
+def save_last_scan_cache(iface: str, mode: str, cameras: list) -> None:
+    payload = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "iface": iface,
+        "mode": mode,
+        "cameras": cameras,
+    }
+    try:
+        with open(LAST_SCAN_CACHE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.chmod(LAST_SCAN_CACHE, 0o666)
+    except Exception:
+        pass
+
+
+# ==============================================================================
+# ОСНОВНОЙ ЦИКЛ ПОИСКА (СТАНДАРТНЫЙ И БЫСТРЫЙ РЕЖИМЫ)
+# ==============================================================================
+def run_discovery(fast_mode: bool = False) -> int:
+    wait_seconds = 5 if fast_mode else 30
+    mode_title = "FAST SCAN (5 сек)" if fast_mode else "ИНТЕРАКТИВНЫЙ РЕЖИМ «ОТКЛЮЧИ -> ПОДКЛЮЧИ» (30 сек)"
+
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE v2.0 — Сканер IP-камер в чужих подсетях | {mode_title}{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, is_wired, wired_ifaces, wifi_ifaces = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    conn_type = "Проводной Ethernet (прямой линк)" if is_wired else "Wi-Fi (через роутер/коммутатор)"
+    carrier_state = "ПОДКЛЮЧЕН (carrier=1)" if get_carrier(iface) else "ОЖИДАНИЕ КАБЕЛЯ (carrier=0)"
+    print(f"{C.BOLD}[ИНТЕРФЕЙС]{C.RESET} Выбран: {C.GREEN}{C.BOLD}{iface}{C.RESET} [{conn_type}] | Статус: {carrier_state}")
+
+    local_macs, local_ips = get_all_local_macs_and_ips()
+    probe_src_ips = set(local_ips)
+
+    # ЭТАП 1: Калибровка сети роутера / Baseline
+    baseline_macs, baseline_ips = calibrate_baseline(iface, local_macs, local_ips)
+
+    # ЭТАП 2: Интерактивный режим «Отключи -> Подключи»
+    if not fast_mode:
+        print(f"\n{C.YELLOW}{C.BOLD}╔══════════════════════════════════════════════════════════════════╗{C.RESET}")
+        print(f"{C.YELLOW}{C.BOLD}║  ШАГ 1: Отключите патчкорд (или питание PoE) камеры от           ║{C.RESET}")
+        print(f"{C.YELLOW}{C.BOLD}║         роутера/свитча/ноутбука на 3 секунды.                    ║{C.RESET}")
+        print(f"{C.YELLOW}{C.BOLD}║  ШАГ 2: Подключите патчкорд камеры обратно. Ожидание пакета      ║{C.RESET}")
+        print(f"{C.YELLOW}{C.BOLD}║         инициализации камеры (до 30 секунд)...                   ║{C.RESET}")
+        print(f"{C.YELLOW}{C.BOLD}╚══════════════════════════════════════════════════════════════════╝{C.RESET}")
+    else:
+        print(f"\n{C.YELLOW}{C.BOLD}[ЭТАП 2/5]{C.RESET} Быстрый режим (fast): сканирование без ожидания переподключения ({wait_seconds} сек)...")
+
+    # ЭТАП 3: Активная L2-провокация + Сниффинг дельты
+    print(f"\n{C.BLUE}{C.BOLD}[ЭТАП 3/5] Активная L2-провокация (ONVIF + SADP) и перехват ARP/UDP дельты...{C.RESET}")
+
+    discovered = {}
+    lock = threading.Lock()
+    stop_event = threading.Event()
+    active_ifaces = [iface]
+    for w_iface in wired_ifaces:
+        if w_iface not in active_ifaces:
+            active_ifaces.append(w_iface)
+
+    def register_detection(src_mac: str, ip_candidate: str, pkt_iface: str, reason: str, meta: dict = None):
+        meta = meta or {}
+        src_mac = src_mac.lower()
+        if src_mac in local_macs or src_mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            return
+        if ip_candidate in probe_src_ips or ip_candidate in ("255.255.255.255", "239.255.255.250", "239.255.255.251"):
+            return
+        if ip_candidate and ip_candidate.startswith(("127.", "224.", "239.")):
+            return
+
+        cam_vendor = meta.get("vendor") or get_camera_vendor(src_mac)
+        if src_mac in baseline_macs and not cam_vendor:
+            return
+
+        with lock:
+            prev = discovered.get(src_mac)
+            if not prev:
+                discovered[src_mac] = {
+                    "mac": src_mac,
+                    "ip": ip_candidate or "0.0.0.0",
+                    "vendor": cam_vendor,
+                    "model": meta.get("model", ""),
+                    "serial": meta.get("serial", ""),
+                    "firmware": meta.get("firmware", ""),
+                    "iface": pkt_iface,
+                    "reason": reason,
+                }
+                if ip_candidate and ip_candidate != "0.0.0.0":
+                    v_label = f" [{cam_vendor}]" if cam_vendor else ""
+                    m_label = f" ({meta['model']})" if meta.get("model") else ""
+                    print(
+                        f"\n  {C.GREEN}{C.BOLD}⚡ [ПЕРЕХВАТ!]{C.RESET} Обнаружено устройство: "
+                        f"IP={C.CYAN}{C.BOLD}{ip_candidate}{C.RESET} | MAC={C.YELLOW}{src_mac.upper()}{C.RESET}"
+                        f"{C.MAGENTA}{v_label}{m_label}{C.RESET} ({reason})"
+                    )
+                    stop_event.set()
+                else:
+                    print(
+                        f"\n  {C.YELLOW}⚡ [GARP 0.0.0.0]{C.RESET} Зафиксирован пакет инициализации от "
+                        f"MAC={C.YELLOW}{src_mac.upper()}{C.RESET} ({reason}). Ожидание IPv4..."
+                    )
+            else:
+                for k in ("model", "serial", "firmware"):
+                    if meta.get(k) and not prev.get(k):
+                        prev[k] = meta[k]
+                if cam_vendor and not prev.get("vendor"):
+                    prev["vendor"] = cam_vendor
+
+                if (prev["ip"] == "0.0.0.0" or not prev["ip"]) and ip_candidate and ip_candidate != "0.0.0.0":
+                    prev["ip"] = ip_candidate
+                    v_label = f" [{prev['vendor']}]" if prev.get("vendor") else ""
+                    print(
+                        f"\n  {C.GREEN}{C.BOLD}⚡ [ПЕРЕХВАТ IP!]{C.RESET} Уточнен адрес устройства: "
+                        f"IP={C.CYAN}{C.BOLD}{ip_candidate}{C.RESET} | MAC={C.YELLOW}{src_mac.upper()}{C.RESET}"
+                        f"{C.MAGENTA}{v_label}{C.RESET} ({reason})"
+                    )
+                    stop_event.set()
+
+    def pkt_callback(pkt):
+        if not pkt.haslayer(Ether):
+            return
+        src_mac = pkt[Ether].src.lower()
+        if src_mac in local_macs or src_mac == "ff:ff:ff:ff:ff:ff":
+            return
+
+        pkt_iface = getattr(pkt, "sniffed_on", iface) or iface
+
+        # 1. Проверка ARP-пакетов
+        if pkt.haslayer(ARP):
+            psrc = pkt[ARP].psrc
+            pdst = pkt[ARP].pdst
+            op = pkt[ARP].op
+            if psrc == "0.0.0.0":
+                candidate = pdst if (pdst and pdst != "0.0.0.0" and pdst not in probe_src_ips) else "0.0.0.0"
+                register_detection(src_mac, candidate, pkt_iface, f"Gratuitous ARP Probe (0.0.0.0 -> {pdst})")
+            else:
+                reason = f"ARP {'Request (who-has ' + pdst + ')' if op == 1 else 'Reply'}"
+                register_detection(src_mac, psrc, pkt_iface, reason)
+            return
+
+        # 2. Проверка IP / UDP пакетов (SADP 37020, ONVIF 3702, Dahua 37810)
+        if pkt.haslayer(IP):
+            src_ip = pkt[IP].src
+            parsed_meta = {}
+
+            if pkt.haslayer(UDP) and pkt.haslayer(Raw):
+                sport = pkt[UDP].sport
+                dport = pkt[UDP].dport
+                raw_bytes = bytes(pkt[Raw].load)
+                if sport in (3702, 37020, 37810) or dport in (3702, 37020, 37810):
+                    parsed_meta = parse_xml_discovery_payload(raw_bytes)
+
+            xml_ip = parsed_meta.get("ip")
+            vendor_hint = parsed_meta.get("vendor", "")
+            effective_ip = xml_ip if (xml_ip and xml_ip != "0.0.0.0") else src_ip
+
+            if vendor_hint or is_camera_mac(src_mac) or (src_mac not in baseline_macs and effective_ip not in baseline_ips and effective_ip != "0.0.0.0"):
+                reason = f"UDP/L2 Response ({vendor_hint or 'IP Packet'})"
+                register_detection(src_mac, effective_ip, pkt_iface, reason, parsed_meta)
+
+    def prover_and_carrier_worker():
+        last_carrier = {w: get_carrier(w) for w in wired_ifaces}
+        next_probe_time = 0.0
+        while not stop_event.is_set():
+            now = time.time()
+            for w_iface in wired_ifaces:
+                cur_c = get_carrier(w_iface)
+                if cur_c != last_carrier.get(w_iface):
+                    last_carrier[w_iface] = cur_c
+                    if cur_c:
+                        print(f"\n  {C.GREEN}{C.BOLD}[LINK UP]{C.RESET} Физический линк на {w_iface} активен (/sys/class/net/{w_iface}/carrier = 1)!")
+                        send_l2_provocations(w_iface, probe_src_ips)
+                    else:
+                        print(f"\n  {C.YELLOW}[LINK DOWN]{C.RESET} Кабель отключен на {w_iface} (/sys/class/net/{w_iface}/carrier = 0).")
+
+            if now >= next_probe_time:
+                for target_iface in active_ifaces:
+                    send_l2_provocations(target_iface, probe_src_ips)
+                next_probe_time = now + 2.0
+
+            stop_event.wait(0.25)
+
+    worker_thread = threading.Thread(target=prover_and_carrier_worker, daemon=True)
+    worker_thread.start()
+
+    start_ts = time.time()
+    try:
+        while not stop_event.is_set():
+            elapsed = time.time() - start_ts
+            remaining = wait_seconds - elapsed
+            if remaining <= 0:
+                break
+            sys.stdout.write(
+                f"\r  {C.CYAN}⏳ Ожидание пакета камеры и отправка ONVIF/SADP L2-провокаций... "
+                f"Осталось: {int(remaining):02d} сек (Ctrl+C для завершения){C.RESET}   "
+            )
+            sys.stdout.flush()
+            sniff(
+                iface=active_ifaces,
+                timeout=min(1.0, remaining),
+                store=False,
+                prn=pkt_callback,
+                stop_filter=lambda _: stop_event.is_set(),
+            )
+        if stop_event.is_set():
+            sniff(iface=active_ifaces, timeout=0.7, store=False, prn=pkt_callback)
+    except KeyboardInterrupt:
+        print(f"\n  {C.YELLOW}[!] Ожидание прервано пользователем (Ctrl+C). Переход к обработке пойманных устройств...{C.RESET}")
+    finally:
+        stop_event.set()
+        sys.stdout.write("\n")
+
+    if not discovered:
+        save_last_scan_cache(iface, "fast" if fast_mode else "interactive", [])
+        print(f"\n{C.YELLOW}{C.BOLD}[РЕЗУЛЬТАТ]{C.RESET} Новых IP-камер или узлов за время окна ожидания не обнаружено.")
+        print(f"{C.DIM}Совет: убедитесь, что питание камеры включено, и повторите запуск `yeee`.{C.RESET}")
+        return 0
+
+    # ЭТАП 4 и ЭТАП 5: Инъекция подсети + проверка портов + карточка
+    print(f"\n{C.BLUE}{C.BOLD}[ЭТАП 4/5] Инъекция временной подсети и [ЭТАП 5/5] Проверка TCP-портов...{C.RESET}")
+    idx = 1
+    results_list = []
+    for mac, cam in discovered.items():
+        cam_ip = cam["ip"]
+        cam_iface = cam.get("iface") or iface
+        if cam_ip and cam_ip != "0.0.0.0":
+            subnet_info = inject_subnet_alias(cam_iface, cam_ip)
+            cam["subnet_info"] = subnet_info
+            time.sleep(0.2)
+            cam["open_ports"] = scan_camera_ports(cam_ip)
+        else:
+            cam["subnet_info"] = {
+                "injected": False,
+                "status": "Камера прислала только 0.0.0.0 (IP не назначен)",
+                "alias_ip": None,
+            }
+            cam["open_ports"] = []
+
+        print_camera_card(idx, cam)
+        results_list.append(cam)
+        idx += 1
+
+    save_last_scan_cache(iface, "fast" if fast_mode else "interactive", results_list)
+    print(f"\n{C.DIM}Для экспорта отчета выполните: {C.BOLD}yeee dump{C.RESET}{C.DIM} | Для очистки подсетей: {C.BOLD}yeee clean{C.RESET}")
+    return 0
+
+
+# ==============================================================================
+# КОМАНДА CONFLICT: АКТИВНЫЙ ARP-СКАНЕР ДУБЛИКАТОВ IP (agent_04_diag)
+# ==============================================================================
+def run_conflict_scan() -> int:
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE CONFLICT — Активный ARP-детектор конфликтов IP-адресов{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, is_wired, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    src_mac = get_iface_mac(iface)
+    local_macs, _ = get_all_local_macs_and_ips()
+    ipv4_list = get_iface_ipv4_list(iface)
+
+    subnets_to_scan = []
+    seen_nets = set()
+    for item in ipv4_list:
+        ip_str = item["ip"]
+        octets = ip_str.split(".")
+        net_24 = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+        if net_24 not in seen_nets:
+            seen_nets.add(net_24)
+            subnets_to_scan.append((ip_str, net_24))
+
+    if not subnets_to_scan:
+        subnets_to_scan.append(("192.168.1.250", "192.168.1.0/24"))
+
+    print(f"{C.BOLD}[ИНТЕРФЕЙС]{C.RESET} {C.GREEN}{iface}{C.RESET} ({src_mac.upper()})")
+    print(f"{C.BOLD}[ПОДСЕТИ]{C.RESET}   {', '.join(n for _, n in subnets_to_scan)}")
+
+    ip_to_macs = {}  # ip -> set(mac)
+    lock = threading.Lock()
+
+    # Предзаполняем текущими записями из /proc/net/arp на данном интерфейсе
+    try:
+        with open("/proc/net/arp", "r") as f:
+            for line in f.read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 6:
+                    ip_a, _, flags, mac_a, _, dev = parts[:6]
+                    mac_a = mac_a.lower()
+                    if dev == iface and flags != "0x0" and mac_a != "00:00:00:00:00:00":
+                        ip_to_macs.setdefault(ip_a, set()).add(mac_a)
+    except Exception:
+        pass
+
+    def arp_pkt_handler(pkt):
+        if not pkt.haslayer(Ether) or not pkt.haslayer(ARP):
+            return
+        s_mac = pkt[Ether].src.lower()
+        psrc = pkt[ARP].psrc
+        if s_mac in local_macs or s_mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            return
+        if not psrc or psrc == "0.0.0.0":
+            return
+        with lock:
+            ip_to_macs.setdefault(psrc, set()).add(s_mac)
+
+    frames = []
+    for src_ip, net_cidr in subnets_to_scan:
+        net_obj = ipaddress.IPv4Network(net_cidr, strict=False)
+        for host_ip in net_obj.hosts():
+            h_str = str(host_ip)
+            if h_str == src_ip:
+                continue
+            frames.append(
+                Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
+                / ARP(op=1, hwsrc=src_mac, psrc=src_ip, hwdst="00:00:00:00:00:00", pdst=h_str)
+            )
+
+    def send_arp_sweep():
+        time.sleep(0.2)
+        try:
+            sendp(frames, iface=iface, verbose=False)
+            time.sleep(1.0)
+            sendp(frames, iface=iface, verbose=False)
+        except Exception:
+            pass
+
+    print(f"{C.BLUE}[СКАНИРОВАНИЕ]{C.RESET} Отправка широковещательных ARP-запросов ({len(frames)} адресов) и сбор ответов (3 сек)...")
+    t = threading.Thread(target=send_arp_sweep, daemon=True)
+    t.start()
+    try:
+        sniff(iface=iface, filter="arp", timeout=3.0, store=False, prn=arp_pkt_handler)
+    except Exception:
+        pass
+
+    conflicts = {ip: macs for ip, macs in ip_to_macs.items() if len(macs) > 1}
+    print(f"\n{C.BOLD}[СВОДКА]{C.RESET} Откликнулось уникальных IP-узлов: {len(ip_to_macs)}")
+
+    if conflicts:
+        for ip, macs in sorted(conflicts.items()):
+            print(f"\n{C.RED}{C.BOLD}🚨 [CRITICAL] IP CONFLICT DETECTED на адресе {ip}!{C.RESET}")
+            for m in sorted(macs):
+                vendor = get_camera_vendor(m) or "Неизвестный вендор / Сетевой узел"
+                print(f"   {C.RED}➔ MAC: {C.BOLD}{m.upper()}{C.RESET} ({C.YELLOW}{vendor}{C.RESET})")
+    else:
+        for ip, macs in sorted(ip_to_macs.items()):
+            m = next(iter(macs))
+            vendor = get_camera_vendor(m) or "Сетевой узел"
+            print(f"  {C.GREEN}✔{C.RESET} {ip:<16} ── {m.upper()} ({C.DIM}{vendor}{C.RESET})")
+        print(f"\n{C.GREEN}{C.BOLD}[OK]{C.RESET} Дубликатов IP (ARP-конфликтов) в активных подсетях не обнаружено.")
+
+    return 0
+
+
+# ==============================================================================
+# КОМАНДА DUMP И DUMP PDF: ЭКСПОРТ В MARKDOWN И PDF В СТИЛЕ PROCAM RADAR
+# ==============================================================================
+def xml_escape(val: str) -> str:
+    """Безопасное экранирование символов для ReportLab Paragraph XML парсера."""
+    return (
+        str(val or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def build_procam_header_table(bold_font: str, base_font: str, title_text: str, subtitle_text: str, total_width_mm: float = 182.0):
+    """Создает фирменную шапку документа ProCam Radar с векторным логотипом Кибер-Совы."""
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, Table, TableStyle
+    from reportlab.graphics.shapes import Drawing, Rect, Polygon, PolyLine, Circle
+
+    # Векторный логотип Cyber-Owl ProCam (44x44 pt)
+    d = Drawing(46, 46)
+    # Темный бейдж #09090B
+    d.add(Rect(1, 1, 44, 44, rx=10, ry=10, fillColor=colors.HexColor("#09090B"), strokeColor=colors.HexColor("#27272A"), strokeWidth=1))
+    # Щит совы (координаты перевернуты по оси Y для ReportLab: y_rl = 46 - y_svg * 0.7)
+    shield_pts = [
+        8, 35,
+        16, 31,
+        23, 36,
+        30, 31,
+        38, 35,
+        39, 22,
+        35, 11,
+        23, 6,
+        11, 11,
+        7, 22,
+    ]
+    d.add(Polygon(shield_pts, fillColor=colors.HexColor("#18181B"), strokeColor=colors.HexColor("#E4E4E7"), strokeWidth=1.4))
+    # V-бровь
+    d.add(PolyLine([9.5, 31, 23, 24, 36.5, 31], strokeColor=colors.HexColor("#FFFFFF"), strokeWidth=1.6))
+    # Левый объектив 4K с изумрудной диафрагмой #10B981
+    d.add(Circle(16, 22, 5.2, fillColor=colors.HexColor("#09090B"), strokeColor=colors.HexColor("#FFFFFF"), strokeWidth=1.4))
+    d.add(Circle(16, 22, 2.5, fillColor=colors.HexColor("#09090B"), strokeColor=colors.HexColor("#10B981"), strokeWidth=1.3))
+    d.add(Circle(17, 23, 1.1, fillColor=colors.HexColor("#10B981"), strokeColor=None))
+    # Правый объектив 4K с изумрудной диафрагмой #10B981
+    d.add(Circle(30, 22, 5.2, fillColor=colors.HexColor("#09090B"), strokeColor=colors.HexColor("#FFFFFF"), strokeWidth=1.4))
+    d.add(Circle(30, 22, 2.5, fillColor=colors.HexColor("#09090B"), strokeColor=colors.HexColor("#10B981"), strokeWidth=1.3))
+    d.add(Circle(31, 23, 1.1, fillColor=colors.HexColor("#10B981"), strokeColor=None))
+    # Клюв
+    d.add(Polygon([23, 19.5, 20.5, 14.5, 23, 10.5, 25.5, 14.5], fillColor=colors.HexColor("#E4E4E7"), strokeColor=None))
+
+    brand_style = ParagraphStyle(
+        "ProCamBrand",
+        fontName=bold_font,
+        fontSize=15,
+        leading=18,
+        textColor=colors.HexColor("#FFFFFF"),
+        spaceAfter=2,
+    )
+    sub_style = ParagraphStyle(
+        "ProCamSub",
+        fontName=base_font,
+        fontSize=8.5,
+        leading=12,
+        textColor=colors.HexColor("#D4D4D8"),
+    )
+
+    right_content = [
+        Paragraph(
+            f'PROCAM <font color="#10B981">RADAR</font> &nbsp;<font size="11" color="#A1A1AA">| &nbsp;{xml_escape(title_text)}</font>',
+            brand_style,
+        ),
+        Paragraph(subtitle_text, sub_style),
+    ]
+
+    hdr_tbl = Table(
+        [[d, right_content]],
+        colWidths=[20 * mm, (total_width_mm - 20) * mm],
+    )
+    hdr_tbl.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#09090B")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (0, 0), 10),
+            ("RIGHTPADDING", (0, 0), (0, 0), 4),
+            ("LEFTPADDING", (1, 0), (1, 0), 6),
+            ("RIGHTPADDING", (1, 0), (1, 0), 12),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#27272A")),
+        ])
+    )
+    return hdr_tbl
+
+
+def generate_pdf_report(scan_data: dict, pdf_filepath: str) -> bool:
+    """Генерирует фирменный инженерный PDF-отчет аудита камер ProCam Radar."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    except ImportError as exc:
+        print(f"  {C.RED}[ОШИБКА PDF] Модуль python3-reportlab не найден: {exc}{C.RESET}")
+        return False
+
+    font_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    if os.path.exists(font_reg):
+        pdfmetrics.registerFont(TTFont("DejaVuSans", font_reg))
+        base_font = "DejaVuSans"
+    else:
+        base_font = "Helvetica"
+
+    if os.path.exists(font_bold):
+        pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", font_bold))
+        bold_font = "DejaVuSans-Bold"
+    else:
+        bold_font = base_font
+
+    doc = SimpleDocTemplate(
+        pdf_filepath,
+        pagesize=landscape(A4),
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title="Инженерный отчет аудита IP-камер (ProCam Radar)",
+    )
+
+    styles = getSampleStyleSheet()
+    section_style = ParagraphStyle(
+        "ProCamSection",
+        parent=styles["Heading2"],
+        fontName=bold_font,
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor("#09090B"),
+        spaceBefore=6,
+        spaceAfter=4,
+    )
+    meta_style = ParagraphStyle(
+        "ProCamMeta",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#27272A"),
+    )
+    cell_style = ParagraphStyle(
+        "ProCamCell",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#09090B"),
+    )
+    header_cell_style = ParagraphStyle(
+        "ProCamHeaderCell",
+        parent=styles["Normal"],
+        fontName=bold_font,
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.white,
+    )
+
+    cameras = scan_data.get("cameras", [])
+    subtitle_meta = (
+        f"<b>Дата отчета:</b> {xml_escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"<b>Скан:</b> {xml_escape(scan_data.get('timestamp', '-'))} &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"<b>Сеть:</b> {xml_escape(scan_data.get('iface', '-'))} &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"<b>Найдено камер:</b> <font color='#10B981'><b>{len(cameras)}</b></font>"
+    )
+
+    elements = [
+        build_procam_header_table(
+            bold_font,
+            base_font,
+            "ИНЖЕНЕРНЫЙ ПАСПОРТ И АУДИТ СЕТИ ВИДЕОНАБЛЮДЕНИЯ",
+            subtitle_meta,
+            total_width_mm=273.0,
+        ),
+        Spacer(1, 5 * mm),
+    ]
+
+    headers = [
+        Paragraph("#", header_cell_style),
+        Paragraph("Статус / Сеть", header_cell_style),
+        Paragraph("IP-адрес", header_cell_style),
+        Paragraph("MAC-адрес", header_cell_style),
+        Paragraph("Производитель", header_cell_style),
+        Paragraph("Модель / Серийный № / ПО", header_cell_style),
+        Paragraph("Порты", header_cell_style),
+        Paragraph("Веб-интерфейс и RTSP поток", header_cell_style),
+    ]
+    table_data = [headers]
+
+    if not cameras:
+        table_data.append([
+            Paragraph("-", cell_style),
+            Paragraph("Нет активных камер", cell_style),
+            Paragraph("-", cell_style),
+            Paragraph("-", cell_style),
+            Paragraph("-", cell_style),
+            Paragraph("Запустите «Найти камеры в сети» в приложении ProCam Radar", cell_style),
+            Paragraph("-", cell_style),
+            Paragraph("-", cell_style),
+        ])
+    else:
+        for idx, cam in enumerate(cameras, 1):
+            enrich_camera_record(cam)
+            if cam.get("conflict"):
+                zone_txt = '<font color="#EF4444"><b>Конфликт IP</b></font>'
+            elif cam.get("is_local_subnet", True):
+                zone_txt = '<font color="#059669"><b>Своя сеть</b></font>'
+            else:
+                zone_txt = '<font color="#D97706"><b>Чужая сеть (Мост)</b></font>'
+            if cam.get("iface"):
+                zone_txt += f"<br/><font size='7' color='#71717A'>Адаптер: {xml_escape(cam.get('iface'))}</font>"
+
+            ports_s = ", ".join(str(p) for p in cam.get("open_ports", [])) or "L2"
+            hw_info = (
+                f"<b>Модель:</b> {xml_escape(cam.get('model', '-'))}<br/>"
+                f"<b>С/Н:</b> {xml_escape(cam.get('serial', '-'))}<br/>"
+                f"<b>ПО:</b> {xml_escape(cam.get('firmware', '-'))}"
+            )
+            links_info = (
+                f"<b>Браузер:</b> {xml_escape(cam.get('web_link', '-'))}<br/>"
+                f"<b>RTSP:</b> {xml_escape(cam.get('rtsp_link', '-'))}"
+            )
+            table_data.append([
+                Paragraph(str(idx), cell_style),
+                Paragraph(zone_txt, cell_style),
+                Paragraph(f"<b>{xml_escape(cam.get('ip', '-'))}</b>", cell_style),
+                Paragraph(xml_escape(cam.get("mac_upper", "-")), cell_style),
+                Paragraph(xml_escape(cam.get("vendor_resolved", "-")), cell_style),
+                Paragraph(hw_info, cell_style),
+                Paragraph(xml_escape(ports_s), cell_style),
+                Paragraph(links_info, cell_style),
+            ])
+
+    col_widths = [9 * mm, 32 * mm, 29 * mm, 32 * mm, 36 * mm, 50 * mm, 21 * mm, 64 * mm]
+    tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+    tbl.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#09090B")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E4E4E7")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ])
+    )
+    elements.append(tbl)
+
+    snaps = [c for c in cameras if c.get("snapshot_path") and os.path.exists(c.get("snapshot_path"))]
+    if snaps:
+        elements.append(Spacer(1, 5 * mm))
+        elements.append(Paragraph("ФОТОФИКСАЦИЯ КАМЕР (КОНТРОЛЬНЫЕ СНИМКИ)", section_style))
+        for cam in snaps:
+            try:
+                elements.append(
+                    Paragraph(
+                        f"<b>Камера {xml_escape(cam.get('ip'))}</b> ({xml_escape(cam.get('mac_upper'))} — {xml_escape(cam.get('vendor_resolved'))})",
+                        meta_style,
+                    )
+                )
+                elements.append(RLImage(cam["snapshot_path"], width=85 * mm, height=48 * mm))
+                elements.append(Spacer(1, 3 * mm))
+            except Exception:
+                pass
+
+    elements.append(Spacer(1, 4 * mm))
+    elements.append(
+        Paragraph(
+            "<b>ProCam Radar v4.0 Engineering Suite</b> &nbsp;·&nbsp; Проектирование, поставка камер Hikvision / HiWatch / Dahua "
+            "и монтаж систем видеонаблюдения: <b>+7 (706) 606-63-23</b> &nbsp;·&nbsp; github.com/Yeeerniyaz/procam-radar",
+            meta_style,
+        )
+    )
+    doc.build(elements)
+    return True
+
+
+def generate_manual_pdf(pdf_filepath: str) -> bool:
+    """
+    Генерирует фирменное руководство по графическому приложению ProCam Radar v4.0 (Windows / Linux / Android)
+    в стиле бренда ProCam (с логотипом Кибер-Совы, без ошибок парсинга XML-тегов и с акцентом на GUI).
+    """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+            KeepTogether,
+        )
+    except ImportError as exc:
+        print(f"{C.RED}[ОШИБКА PDF] Модуль python3-reportlab не установлен: {exc}{C.RESET}")
+        return False
+
+    font_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    font_mono = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+
+    base_font = "Helvetica"
+    bold_font = "Helvetica-Bold"
+    mono_font = "Courier"
+
+    if os.path.exists(font_reg):
+        pdfmetrics.registerFont(TTFont("DejaVuSans", font_reg))
+        base_font = "DejaVuSans"
+    if os.path.exists(font_bold):
+        pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", font_bold))
+        bold_font = "DejaVuSans-Bold"
+    if os.path.exists(font_mono):
+        pdfmetrics.registerFont(TTFont("DejaVuSansMono", font_mono))
+        mono_font = "DejaVuSansMono"
+
+    doc = SimpleDocTemplate(
+        pdf_filepath,
+        pagesize=A4,
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title="Руководство по графическому приложению ProCam Radar v4.0",
+    )
+
+    styles = getSampleStyleSheet()
+    h2_style = ParagraphStyle(
+        "ProCamH2",
+        parent=styles["Heading2"],
+        fontName=bold_font,
+        fontSize=11.5,
+        leading=15,
+        textColor=colors.HexColor("#09090B"),
+        spaceBefore=9,
+        spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "ProCamBody",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=8.8,
+        leading=12.8,
+        textColor=colors.HexColor("#18181B"),
+        spaceAfter=4,
+    )
+    card_style = ParagraphStyle(
+        "ProCamCard",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=8.5,
+        leading=12.2,
+        textColor=colors.HexColor("#18181B"),
+        backColor=colors.HexColor("#FAFAFA"),
+        borderColor=colors.HexColor("#E4E4E7"),
+        borderWidth=0.7,
+        borderPadding=6,
+        spaceAfter=5,
+    )
+    th_style = ParagraphStyle(
+        "ProCamTH",
+        parent=styles["Normal"],
+        fontName=bold_font,
+        fontSize=8.3,
+        leading=11,
+        textColor=colors.white,
+    )
+    td_btn_style = ParagraphStyle(
+        "ProCamTDBtn",
+        parent=styles["Normal"],
+        fontName=bold_font,
+        fontSize=8.2,
+        leading=11,
+        textColor=colors.HexColor("#059669"),
+    )
+    td_style = ParagraphStyle(
+        "ProCamTD",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=8.1,
+        leading=11,
+        textColor=colors.HexColor("#18181B"),
+    )
+    td_mono_style = ParagraphStyle(
+        "ProCamTDMono",
+        parent=styles["Normal"],
+        fontName=mono_font,
+        fontSize=7.8,
+        leading=10.5,
+        textColor=colors.HexColor("#09090B"),
+    )
+
+    story = []
+
+    # Фирменная шапка с логотипом Кибер-Совы ProCam
+    story.append(
+        build_procam_header_table(
+            bold_font,
+            base_font,
+            "РУКОВОДСТВО ПО ГРАФИЧЕСКОМУ ПРИЛОЖЕНИЮ v4.0",
+            "Профессиональная программа для Windows и Linux: мгновенный поиск IP-камер Hikvision / HiWatch / Dahua, "
+            "одновременная работа с Wi-Fi и кабелем Ethernet, подбор пула свободных IP и проверка линии PoE.",
+            total_width_mm=182.0,
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+
+    # Раздел 1: Работа с графическим приложением и двумя сетями
+    story.append(Paragraph("// 01 · ГРАФИЧЕСКОЕ ПРИЛОЖЕНИЕ И ОДНОВРЕМЕННАЯ РАБОТА WI-FI + КАБЕЛЬ", h2_style))
+    story.append(
+        Paragraph(
+            "• <b>Полностью графическое управление:</b> Все операции выполняются кнопками в окне приложения "
+            "<b>ProCam Radar</b> без необходимости вводить команды в терминале. Доступны версии для <b>Windows (.exe)</b> "
+            "и <b>Linux (x64)</b>.<br/>"
+            "• <b>Одновременная работа Wi-Fi и кабеля Ethernet без обрыва интернета:</b> Если ноутбук подключен по "
+            "<b>Wi-Fi к роутеру</b> (интернет) и одновременно вы подключаете <b>кабель Ethernet</b> напрямую к камере или "
+            "коммутатору PoE, программа видит обе сети одновременно. В верхней панели можно выбрать режим "
+            "<b>«Авто (Кабель + Wi-Fi)»</b>, <b>«Только Кабель»</b> или <b>«Только Wi-Fi»</b>.<br/>"
+            "• <b>Защита от конфликта маршрутов:</b> Даже если подсеть камеры на кабеле (например, <b>192.168.1.64</b>) "
+            "совпадает с подсетью вашего Wi-Fi роутера (<b>192.168.1.1</b>), приложение создает точечный маршрут <b>/32</b> "
+            "именно к камере через кабель, сохраняя работу Wi-Fi и интернета без разрывов!",
+            body_style,
+        )
+    )
+
+    # Раздел 2: Справочник кнопок графического интерфейса
+    story.append(Paragraph("// 02 · ФУНКЦИИ И КНОПКИ ГРАФИЧЕСКОГО ПРИЛОЖЕНИЯ", h2_style))
+
+    gui_rows = [
+        [
+            Paragraph("Кнопка в приложении", th_style),
+            Paragraph("Что делает функция и как ей пользоваться", th_style),
+            Paragraph("Пароль камеры", th_style),
+        ],
+        [
+            Paragraph("Найти камеры в сети", td_btn_style),
+            Paragraph(
+                "Запускает двухуровневый оптический радар (~4 сек) сразу по кабелю Ethernet и Wi-Fi. Находит камеры "
+                "в родной сети роутера, камеры в чужих подсетях (ONVIF, Hikvision SADP, Dahua) и подсвечивает конфликты IP.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Поиск по кабелю (Отключи → Включи)", td_btn_style),
+            Paragraph(
+                "Интерактивный режим определения конкретной камеры: отключите патч-корд (или порт PoE) на 3 секунды "
+                "и включите обратно. Приложение мгновенно перехватит пакет включения камеры и покажет её карточку.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Подбор свободных IP (выбор количества)", td_btn_style),
+            Paragraph(
+                "Укажите нужное количество камер (быстрые кнопки <b>1, 4, 8, 16, 32, 64</b> или любое число вручную) "
+                "и целевую подсеть. Программа проверит все 254 адреса и выдаст готовый непрерывный диапазон свободных IP.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Открыть по MAC (при конфликте)", td_btn_style),
+            Paragraph(
+                "Если две или более камер висят на одном IP (например, <b>192.168.1.64</b>) или камера в чужой подсети — "
+                "жестко привязывает выбранный MAC-адрес и открывает веб-страницу именно этой камеры без отключения кабелей.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Открыть в браузере", td_btn_style),
+            Paragraph(
+                "Автоматически прокидывает сетевой мост к выбранной камере (даже если она в другой подсети) "
+                "и открывает её веб-интерфейс <b>http(s)://IP</b> в браузере одним кликом.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Смотреть видео (RTSP) / Сделать снимок", td_btn_style),
+            Paragraph(
+                "Открывает живой видеопоток камеры в плеере (основной поток 101 или субпоток 102) либо сохраняет "
+                "контрольный JPEG стоп-кадр для автоматического добавления в PDF-отчет заказчику.",
+                td_style,
+            ),
+            Paragraph("По умолчанию / свой", td_style),
+        ],
+        [
+            Paragraph("Паспорт камеры", td_btn_style),
+            Paragraph(
+                "Беспарольная диагностика выбранной камеры в отдельном окне: статус активации (новая из коробки или "
+                "активирована), проверка точности внутренних часов ONVIF (рассинхрон NTP), RTSP-баннер и SSL-сертификат.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Проверка кабеля и PoE", td_btn_style),
+            Paragraph(
+                "Стресс-тест витой пары и обжима RJ-45: сравнивает прохождение коротких пакетов (64 байта) и тяжелых "
+                "пакетов полного кадра (1472 байта, MTU 1500). Выявляет плохой обжим, омедненный кабель (CCA) и просадку PoE.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+        [
+            Paragraph("Изменить IP-адрес", td_btn_style),
+            Paragraph(
+                "Дистанционно меняет IP-адрес и шлюз выбранной камеры через протоколы Hikvision ISAPI, Dahua CGI или ONVIF. "
+                "Если пароль не введен — автоматически проверяет стандартные заводские пароли.",
+                td_style,
+            ),
+            Paragraph("Авто-подбор / свой", td_style),
+        ],
+        [
+            Paragraph("Пакетная активация / Развести конфликт", td_btn_style),
+            Paragraph(
+                "Позволяет в один клик активировать партию новых камер «из коробки» единым паролем и автоматически "
+                "раздать им последовательные IP-адреса (+1, +2, +3...) без отключения патч-кордов от коммутатора.",
+                td_style,
+            ),
+            Paragraph("Задает новый / свой", td_style),
+        ],
+        [
+            Paragraph("Скачать PDF-отчет / Очистить сети", td_btn_style),
+            Paragraph(
+                "Формирует и скачивает готовый инженерный PDF-отчет аудита со списком всех найденных камер для сдачи "
+                "объекта заказчику. Кнопка «Очистить временные сети» убирает все добавленные мосты после завершения настройки.",
+                td_style,
+            ),
+            Paragraph("Не нужен", td_style),
+        ],
+    ]
+
+    tbl = Table(gui_rows, colWidths=[44 * mm, 108 * mm, 30 * mm], repeatRows=1)
+    tbl.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#09090B")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E4E4E7")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ])
+    )
+    story.append(tbl)
+
+    # Раздел 3: Практические сценарии в графическом приложении
+    story.append(Paragraph("// 03 · ПОШАГОВЫЕ СЦЕНАРИИ РАБОТЫ В ГРАФИЧЕСКОМ ОКНЕ", h2_style))
+
+    scenarios = [
+        (
+            "1. Как настроить камеры, когда ноутбук подключен одновременно к Wi-Fi (интернет) и кабелем к свитчу/камере?",
+            "В шапке приложения ProCam Radar отображаются оба ваших подключения: Проводной кабель (Ethernet) и Wi-Fi. "
+            "Оставьте переключатель сети в положении «Авто (Кабель + Wi-Fi)» и нажмите кнопку «Найти камеры в сети». "
+            "Программа найдет камеры на кабеле и в Wi-Fi сети, автоматически построит точечный мост к камере по кабелю и сохранит интернет по Wi-Fi.",
+        ),
+        (
+            "2. Как подобрать свободные IP-адреса под нужное количество новых камер (например, 6 или 16 штук)?",
+            "Нажмите кнопку «Подбор свободных IP», введите нужное количество камер в поле «Сколько IP нужно» (или нажмите быструю кнопку 4 / 8 / 16 / 32) "
+            "и нажмите «Найти свободные адреса». Программа просканирует всю подсеть /24 и покажет непрерывный свободный диапазон: кликните по любому адресу, "
+            "чтобы сразу подставить его в поле «Новый IP».",
+        ),
+        (
+            "3. Что делать, если несколько новых камер висят на одном заводском IP (192.168.1.64 или 192.168.1.108)?",
+            "Во вкладке «Конфликты» вы увидите все камеры на одном IP с разными MAC-адресами. Выберите нужную камеру в таблице и нажмите "
+            "«Открыть по MAC (при конфликте)» — приложение изолирует её по физическому MAC-адресу и откроет в браузере, либо нажмите "
+            "«Развести конфликт IP», чтобы программа сама по очереди назначила им адреса .101, .102, .103...",
+        ),
+        (
+            "4. Камера пингуется, но видео пропадает или тормозит — как проверить кабель и обжим RJ-45?",
+            "Выберите камеру в таблице и нажмите кнопку «Проверка кабеля и PoE». Приложение проведет сравнение 64-байтных пакетов и тяжелых пакетов "
+            "1472 байта (полный кадр MTU 1500). Если на тяжелых пакетах есть потери — необходимо переобжать коннектор RJ-45 или проверить питание PoE.",
+        ),
+    ]
+
+    for title_s, desc_s in scenarios:
+        story.append(
+            KeepTogether([
+                Paragraph(f"<b>{xml_escape(title_s)}</b><br/>{xml_escape(desc_s)}", card_style),
+            ])
+        )
+
+    # Раздел 4: Компактная памятка CLI (со всеми экранированными <IP> без единой ошибки!)
+    story.append(Paragraph("// 04 · ДОПОЛНИТЕЛЬНО: БЫСТРЫЙ ЗАПУСК ИЗ КОНСОЛИ (ДЛЯ ИНЖЕНЕРОВ)", h2_style))
+    cli_rows = [
+        [
+            Paragraph("Команда запуска", th_style),
+            Paragraph("Описание действия", th_style),
+        ],
+        [
+            Paragraph(xml_escape("yeee gui  (или запуск ярлыка ProCam Radar)"), td_mono_style),
+            Paragraph("Открыть главное графическое приложение ProCam Radar (рекомендуемый режим работы).", td_style),
+        ],
+        [
+            Paragraph(xml_escape("yeee scan   |   yeee free <КОЛИЧЕСТВО>"), td_mono_style),
+            Paragraph("Быстрое сканирование всех сетей (Кабель + Wi-Fi) или поиск указанного числа свободных IP.", td_style),
+        ],
+        [
+            Paragraph(xml_escape("yeee open <IP> [--mac <MAC>]   |   yeee cable <IP>"), td_mono_style),
+            Paragraph("Открыть камеру в браузере с L2-изоляцией по MAC-адресу или проверить физический кабель RJ-45.", td_style),
+        ],
+        [
+            Paragraph(xml_escape("yeee set-ip <СТАРЫЙ_IP> <НОВЫЙ_IP> [ЛОГИН] [ПАРОЛЬ] [--mac <MAC>]"), td_mono_style),
+            Paragraph("Дистанционная смена IP-адреса камеры (или пакетное разведение через yeee resolve).", td_style),
+        ],
+    ]
+    cli_tbl = Table(cli_rows, colWidths=[78 * mm, 104 * mm], repeatRows=1)
+    cli_tbl.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#18181B")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E4E4E7")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ])
+    )
+    story.append(cli_tbl)
+
+    doc.build(story)
+    return True
+
+
+def run_manual_command() -> int:
+    out_paths = [
+        os.path.join(os.getcwd(), "PROCAM_RADAR_MANUAL_RU.pdf"),
+    ]
+    proj_dir = "/home/yerniyaz/Desktop/projects/yeee-cam"
+    if os.path.isdir(proj_dir):
+        p_path = os.path.join(proj_dir, "PROCAM_RADAR_MANUAL_RU.pdf")
+        if p_path not in out_paths:
+            out_paths.append(p_path)
+
+    print(f"{C.CYAN}{C.BOLD}[PROCAM RADAR · ИНСТРУКЦИЯ]{C.RESET} Генерация руководства по графическому приложению в PDF...")
+    for path in out_paths:
+        if generate_manual_pdf(path):
+            owner = chown_to_sudo_user(path)
+            print(f"  {C.GREEN}✔ PDF-инструкция сохранена:{C.RESET} {C.BOLD}{path}{C.RESET} (владелец: {C.CYAN}{owner}{C.RESET})")
+        else:
+            return 1
+    return 0
+
+
+def run_dump_report(fmt: str = "both") -> int:
+    print(f"{C.CYAN}{C.BOLD}[YEEE DUMP]{C.RESET} Формирование инженерного отчета аудита камер ({fmt.upper()})...")
+
+    scan_data = None
+    if os.path.exists(LAST_SCAN_CACHE):
+        try:
+            with open(LAST_SCAN_CACHE, "r", encoding="utf-8") as f:
+                scan_data = json.load(f)
+        except Exception:
+            scan_data = None
+
+    if not scan_data:
+        try:
+            iface, _, _, _ = discover_interfaces()
+        except Exception:
+            iface = "unknown"
+        scan_data = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "iface": iface,
+            "mode": "no-prior-scan",
+            "cameras": [],
+        }
+
+    ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cameras = scan_data.get("cameras", [])
+
+    if fmt in ("md", "both"):
+        md_filename = f"cameras_audit_{ts_file}.md"
+        md_filepath = os.path.join(os.getcwd(), md_filename)
+        lines = [
+            f"# Инженерный отчет аудита IP-камер (`yeee dump`)",
+            f"",
+            f"- **Дата генерации отчета**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
+            f"- **Время последнего сканирования**: `{scan_data.get('timestamp', '-')}`",
+            f"- **Сетевой интерфейс**: `{scan_data.get('iface', '-')}`",
+            f"- **Режим сканирования**: `{scan_data.get('mode', '-')}`",
+            f"- **Обнаружено камер**: `{len(cameras)}`",
+            f"",
+            f"## Сводная таблица обнаруженных устройств",
+            f"",
+            f"| # | IP-адрес | MAC-адрес | Вендор | Модель | Серийный номер | Прошивка | Порты | HTTP/HTTPS | RTSP |",
+            f"| :-: | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+
+        if not cameras:
+            lines.append("| - | *Нет данных* | - | - | - | - | - | - | - | - |")
+        else:
+            for idx, cam in enumerate(cameras, 1):
+                enrich_camera_record(cam)
+                ports_s = ", ".join(str(p) for p in cam.get("open_ports", [])) or "Закрыты"
+                lines.append(
+                    f"| {idx} | `{cam.get('ip', '-')}` | `{cam.get('mac_upper', '-')}` | "
+                    f"{cam.get('vendor_resolved', '-')} | {cam.get('model', '-')} | "
+                    f"`{cam.get('serial', '-')}` | `{cam.get('firmware', '-')}` | "
+                    f"`{ports_s}` | [{cam.get('web_link', '-')}]({cam.get('web_link', '-')}) | "
+                    f"`{cam.get('rtsp_link', '-')}` |"
+                )
+
+        lines.append("")
+        with open(md_filepath, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        owner_user = chown_to_sudo_user(md_filepath)
+        print(f"  {C.GREEN}✔ Markdown-отчет сохранен:{C.RESET} {C.BOLD}{md_filepath}{C.RESET} (владелец: {C.CYAN}{owner_user}{C.RESET})")
+
+    if fmt in ("pdf", "both"):
+        pdf_filename = f"cameras_audit_{ts_file}.pdf"
+        pdf_filepath = os.path.join(os.getcwd(), pdf_filename)
+        if generate_pdf_report(scan_data, pdf_filepath):
+            owner_user = chown_to_sudo_user(pdf_filepath)
+            print(f"  {C.GREEN}✔ PDF-отчет сохранен     :{C.RESET} {C.BOLD}{pdf_filepath}{C.RESET} (владелец: {C.CYAN}{owner_user}{C.RESET})")
+        elif fmt == "pdf":
+            return 1
+
+    return 0
+
+
+# ==============================================================================
+# КОМАНДА OPEN: ИНЪЕКЦИЯ ПОДСЕТИ, L2-ИЗОЛЯЦИЯ ПО MAC И ОТКРЫТИЕ БРАУЗЕРА
+# ==============================================================================
+def run_open_camera(target_ip: str, target_mac: str = None) -> int:
+    try:
+        ipaddress.IPv4Address(target_ip)
+    except ValueError:
+        print(f"{C.RED}[ОШИБКА] Некорректный IPv4-адрес: {target_ip}{C.RESET}")
+        return 1
+
+    norm_mac = None
+    if target_mac:
+        norm_mac = normalize_mac(target_mac)
+        if not norm_mac:
+            print(f"{C.RED}[ОШИБКА] Некорректный формат MAC-адреса: {target_mac} (ожидается XX:XX:XX:XX:XX:XX){C.RESET}")
+            return 1
+
+    print(f"{C.CYAN}{C.BOLD}[YEEE OPEN]{C.RESET} Подготовка подключения к камере {C.BOLD}{target_ip}{C.RESET} (пароль не требуется)...")
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    sub_res = inject_subnet_alias(iface, target_ip)
+    print(f"  {C.GREEN}✔ Интерфейс:{C.RESET} {iface} | {sub_res.get('status')}")
+
+    if norm_mac:
+        pin_res = run_cmd(["ip", "neigh", "replace", target_ip, "lladdr", norm_mac, "nud", "permanent", "dev", iface])
+        if pin_res.returncode == 0:
+            print(
+                f"  {C.MAGENTA}🔒 [L2 ИЗОЛЯЦИЯ БЕЗ ПАРОЛЯ]{C.RESET} Весь трафик к {C.BOLD}{target_ip}{C.RESET} жестко привязан к MAC "
+                f"{C.YELLOW}{C.BOLD}{norm_mac.upper()}{C.RESET}!\n"
+                f"     Вторая конфликтующая камера на этом же IP полностью игнорируется ядром Linux.\n"
+                f"     Теперь вы можете активировать эту камеру или задать ей IP прямо в браузере."
+            )
+
+    has_80 = check_single_port(target_ip, 80, timeout=0.6)
+    has_443 = check_single_port(target_ip, 443, timeout=0.6)
+    url = f"https://{target_ip}" if (has_443 and not has_80) else f"http://{target_ip}"
+
+    uinfo = get_sudo_user_info()
+    print(f"  {C.BLUE}➔ Открытие {C.BOLD}{url}{C.RESET}{C.BLUE} в браузере пользователя {C.BOLD}{uinfo['user']}{C.RESET}...")
+    ok = run_gui_as_sudo_user(["xdg-open", url])
+    return 0 if ok else 1
+
+
+# ==============================================================================
+# КОМАНДА SET-IP И RESOLVE: СМЕНА IP И РАЗВЕДЕНИЕ КОЛЛИЗИЙ ПО MAC (agent_05 / agent_07)
+# ==============================================================================
+def normalize_mac(mac_str: str) -> str:
+    if not mac_str:
+        return ""
+    m = mac_str.strip().lower().replace("-", ":")
+    if re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", m):
+        return m
+    return ""
+
+
+DEFAULT_CREDENTIAL_CANDIDATES = [
+    ("admin", ""),
+    ("admin", "admin"),
+    ("admin", "12345"),
+    ("admin", "123456"),
+    ("admin", "888888"),
+    ("admin", "111111"),
+]
+
+
+def run_set_ip(
+    old_ip: str,
+    new_ip: str,
+    username: str = None,
+    password: str = None,
+    gateway: str = None,
+    target_mac: str = None,
+) -> int:
+    if requests is None:
+        print(f"{C.RED}[ОШИБКА] Модуль python3-requests не установлен. Установите: sudo apt install python3-requests{C.RESET}")
+        return 1
+
+    try:
+        ipaddress.IPv4Address(old_ip)
+        ipaddress.IPv4Address(new_ip)
+    except ValueError as exc:
+        print(f"{C.RED}[ОШИБКА] Некорректный IP-адрес: {exc}{C.RESET}")
+        return 1
+
+    norm_mac = None
+    if target_mac:
+        norm_mac = normalize_mac(target_mac)
+        if not norm_mac:
+            print(f"{C.RED}[ОШИБКА] Некорректный формат MAC-адреса: {target_mac} (ожидается XX:XX:XX:XX:XX:XX){C.RESET}")
+            return 1
+
+    if not gateway:
+        octets = new_ip.split(".")
+        gateway = f"{octets[0]}.{octets[1]}.{octets[2]}.1"
+    else:
+        try:
+            ipaddress.IPv4Address(gateway)
+        except ValueError:
+            print(f"{C.RED}[ОШИБКА] Некорректный IP шлюза: {gateway}{C.RESET}")
+            return 1
+
+    if username is not None and password is not None:
+        cred_list = [(username, password)]
+        cred_desc = f"{username} / {'*' * len(password) if password else '<пустой>'}"
+    else:
+        cred_list = DEFAULT_CREDENTIAL_CANDIDATES
+        cred_desc = "АВТО-ПОДБОР заводских паролей (пустой, admin, 12345, 123456, 888888)"
+
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE SET-IP — Дистанционная смена сетевых реквизитов камеры{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"  {C.BOLD}Старый IP :{C.RESET} {C.YELLOW}{old_ip}{C.RESET}")
+    print(f"  {C.BOLD}Новый IP  :{C.RESET} {C.GREEN}{C.BOLD}{new_ip}{C.RESET} (маска 255.255.255.0)")
+    print(f"  {C.BOLD}Шлюз (GW) :{C.RESET} {C.CYAN}{gateway}{C.RESET}")
+    if norm_mac:
+        print(f"  {C.BOLD}Целевой MAC:{C.RESET} {C.MAGENTA}{C.BOLD}{norm_mac.upper()}{C.RESET} (Принудительная L2 ARP-привязка)")
+    print(f"  {C.BOLD}Авторизация:{C.RESET} {cred_desc}")
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    # 1. Авто-инъекция подсети OLD_IP
+    old_sub = inject_subnet_alias(iface, old_ip)
+    print(f"\n{C.BLUE}[ШАГ 1/3]{C.RESET} Подготовка маршрута к {old_ip} на {iface}: {old_sub.get('status')}")
+
+    # Если указан --mac, жестко привязываем статическую запись в ARP-таблице ядра Linux
+    if norm_mac:
+        arp_pin_cmd = ["ip", "neigh", "replace", old_ip, "lladdr", norm_mac, "nud", "permanent", "dev", iface]
+        pin_res = run_cmd(arp_pin_cmd)
+        if pin_res.returncode == 0:
+            print(
+                f"  {C.MAGENTA}🔒 [ARP PIN]{C.RESET} Зафиксирована статическая ARP-запись: "
+                f"{C.BOLD}ip neigh replace {old_ip} lladdr {norm_mac} nud permanent dev {iface}{C.RESET}"
+            )
+        else:
+            print(f"  {C.YELLOW}[!] Предупреждение ARP-привязки: {pin_res.stderr.strip()}{C.RESET}")
+
+    time.sleep(0.2)
+    success = False
+    used_proto = ""
+    matched_user, matched_pass = cred_list[0]
+
+    try:
+        for cur_user, cur_pass in cred_list:
+            # 2. Попытка №1: Hikvision ISAPI
+            print(f"{C.BLUE}[ШАГ 2/3]{C.RESET} Пробуем [{cur_user}:{cur_pass or '<пусто>'}] — Hikvision ISAPI...")
+            isapi_url = f"http://{old_ip}/ISAPI/System/Network/interfaces/1/ipAddress"
+            isapi_xml = (
+                "<IPAddress>"
+                "<ipVersion>v4</ipVersion>"
+                "<AddressingFormatType>static</AddressingFormatType>"
+                f"<ipAddress>{new_ip}</ipAddress>"
+                "<subnetMask>255.255.255.0</subnetMask>"
+                f"<DefaultGateway><ipAddress>{gateway}</ipAddress></DefaultGateway>"
+                "</IPAddress>"
+            )
+            try:
+                resp = requests.put(
+                    isapi_url,
+                    data=isapi_xml.encode("utf-8"),
+                    headers={"Content-Type": "application/xml"},
+                    auth=HTTPDigestAuth(cur_user, cur_pass),
+                    timeout=2.5,
+                    verify=False,
+                )
+                if resp.status_code in (200, 201, 204) or "<statusString>OK</statusString>" in resp.text or "Reboot" in resp.text:
+                    success = True
+                    used_proto = f"Hikvision ISAPI ({cur_user}:{cur_pass or '<пусто>'})"
+                    matched_user, matched_pass = cur_user, cur_pass
+                    print(f"  {C.GREEN}✔ Hikvision ISAPI принял новую конфигурацию (HTTP {resp.status_code})!{C.RESET}")
+                    break
+            except requests.exceptions.ReadTimeout:
+                success = True
+                used_proto = f"Hikvision ISAPI ({cur_user}:{cur_pass or '<пусто>'})"
+                matched_user, matched_pass = cur_user, cur_pass
+                print(f"  {C.GREEN}✔ Запрос ISAPI отправлен (камера мгновенно переключила IP).{C.RESET}")
+                break
+            except Exception:
+                pass
+
+            # 3. Попытка №2: Dahua CGI
+            dahua_url = (
+                f"http://{old_ip}/cgi-bin/configManager.cgi?action=setConfig"
+                f"&Network.eth0.IPAddress={new_ip}"
+                f"&Network.eth0.SubnetMask=255.255.255.0"
+                f"&Network.eth0.DefaultGateway={gateway}"
+                f"&Network.eth0.DhcpEnable=false"
+            )
+            try:
+                resp = requests.get(
+                    dahua_url,
+                    auth=HTTPDigestAuth(cur_user, cur_pass),
+                    timeout=2.5,
+                    verify=False,
+                )
+                if resp.status_code == 200 and ("ok" in resp.text.lower() or not resp.text.strip()):
+                    success = True
+                    used_proto = f"Dahua CGI ({cur_user}:{cur_pass or '<пусто>'})"
+                    matched_user, matched_pass = cur_user, cur_pass
+                    print(f"  {C.GREEN}✔ Dahua CGI принял новую конфигурацию!{C.RESET}")
+                    break
+            except requests.exceptions.ReadTimeout:
+                success = True
+                used_proto = f"Dahua CGI ({cur_user}:{cur_pass or '<пусто>'})"
+                matched_user, matched_pass = cur_user, cur_pass
+                print(f"  {C.GREEN}✔ Запрос Dahua CGI отправлен (камера переключает IP).{C.RESET}")
+                break
+            except Exception:
+                pass
+
+            # 4. Попытка №3: ONVIF SetNetworkInterfaces SOAP
+            onvif_url = f"http://{old_ip}/onvif/device_service"
+            onvif_soap = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+                'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+                'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                "<s:Body>"
+                "<tds:SetNetworkInterfaces>"
+                "<tds:InterfaceToken>eth0</tds:InterfaceToken>"
+                "<tds:NetworkInterface>"
+                "<tt:Enabled>true</tt:Enabled>"
+                "<tt:IPv4>"
+                "<tt:Enabled>true</tt:Enabled>"
+                "<tt:Manual>"
+                f"<tt:Address>{new_ip}</tt:Address>"
+                "<tt:PrefixLength>24</tt:PrefixLength>"
+                "</tt:Manual>"
+                "<tt:DHCP>false</tt:DHCP>"
+                "</tt:IPv4>"
+                "</tds:NetworkInterface>"
+                "</tds:SetNetworkInterfaces>"
+                "</s:Body>"
+                "</s:Envelope>"
+            )
+            try:
+                resp = requests.post(
+                    onvif_url,
+                    data=onvif_soap.encode("utf-8"),
+                    headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+                    auth=HTTPDigestAuth(cur_user, cur_pass),
+                    timeout=2.5,
+                    verify=False,
+                )
+                if resp.status_code == 200 and "Fault" not in resp.text:
+                    success = True
+                    used_proto = f"ONVIF SOAP ({cur_user}:{cur_pass or '<пусто>'})"
+                    matched_user, matched_pass = cur_user, cur_pass
+                    print(f"  {C.GREEN}✔ ONVIF SetNetworkInterfaces выполнен успешно!{C.RESET}")
+                    break
+            except Exception:
+                pass
+    finally:
+        # Обязательное удаление статической ARP-записи после попытки смены IP
+        if norm_mac:
+            run_cmd(["ip", "neigh", "del", old_ip, "dev", iface])
+            print(f"  {C.MAGENTA}🔓 [ARP UNPIN]{C.RESET} Статическая ARP-запись снята: {C.BOLD}ip neigh del {old_ip} dev {iface}{C.RESET}")
+
+    # 5. Инъекция подсети NEW_IP и проверка ping
+    print(f"\n{C.BLUE}[ШАГ 3/3]{C.RESET} Проверка доступности нового адреса {C.BOLD}{new_ip}{C.RESET}...")
+    inject_subnet_alias(iface, new_ip)
+    ping_res = run_cmd(["ping", "-c", "2", "-W", "1", new_ip])
+    if ping_res.returncode == 0:
+        print(f"  {C.GREEN}{C.BOLD}✔ ПИНГ УСПЕШЕН!{C.RESET} Камера отвечает на новом адресе {C.CYAN}{C.BOLD}{new_ip}{C.RESET} ({used_proto or 'Verified'}).")
+        print(f"  {C.BOLD}Новая веб-ссылка :{C.RESET} {C.BLUE}{C.BOLD}http://{new_ip}{C.RESET}")
+        print(f"  {C.BOLD}Новый RTSP-поток :{C.RESET} {C.CYAN}rtsp://{matched_user}:{matched_pass}@{new_ip}:554/Streaming/Channels/101{C.RESET}")
+        return 0
+    else:
+        if success:
+            print(f"  {C.YELLOW}[!] Команда смены IP принята ({used_proto}), ожидается перезагрузка сетевого стека камеры.{C.RESET}")
+            print(f"  {C.BOLD}Новая веб-ссылка :{C.RESET} {C.BLUE}{C.BOLD}http://{new_ip}{C.RESET}")
+            return 0
+        print(
+            f"  {C.RED}[✖] Автоматическая смена IP без пароля не прошла (камера требует активации или нестандартный пароль).{C.RESET}\n"
+            f"  {C.YELLOW}💡 РЕШЕНИЕ БЕЗ ПАРОЛЯ:{C.RESET} Запустите {C.WHITE}{C.BOLD}yeee open {old_ip}"
+            f"{' --mac ' + norm_mac.upper() if norm_mac else ''}{C.RESET} —\n"
+            f"     утилита изолирует именно эту камеру по MAC и откроет её веб-интерфейс для первичной активации!"
+        )
+        return 1
+
+
+def run_resolve_conflicts(
+    conflict_ip: str,
+    start_new_ip: str,
+    username: str,
+    password: str,
+    gateway: str = None,
+) -> int:
+    """
+    Пакетный режим бесконтактного разведения камер, сидящих на одном IP (yeee resolve):
+    1. Находит все MAC-адреса, откликающиеся на <CONFLICT_IP>.
+    2. По очереди фиксирует каждый MAC через `ip neigh replace <CONFLICT_IP> lladdr <MAC> nud permanent dev <iface>`,
+       меняет IP на <START_NEW_IP> + i и снимает ARP-запись (`ip neigh del <CONFLICT_IP> dev <iface>`).
+    """
+    try:
+        ipaddress.IPv4Address(conflict_ip)
+        base_new_ip_obj = ipaddress.IPv4Address(start_new_ip)
+    except ValueError as exc:
+        print(f"{C.RED}[ОШИБКА] Некорректный IPv4-адрес: {exc}{C.RESET}")
+        return 1
+
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE RESOLVE — Пакетное разведение конфликтующих камер по MAC{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    sub_info = inject_subnet_alias(iface, conflict_ip)
+    print(f"{C.BOLD}[ИНТЕРФЕЙС]{C.RESET} {C.GREEN}{iface}{C.RESET} | {sub_info.get('status')}")
+    print(f"{C.BLUE}[ПОИСК КОЛЛИЗИЙ]{C.RESET} Сбор всех MAC-адресов, сидящих на {C.YELLOW}{C.BOLD}{conflict_ip}{C.RESET}...")
+
+    local_macs, _ = get_all_local_macs_and_ips()
+    src_mac = get_iface_mac(iface)
+    ipv4_list = get_iface_ipv4_list(iface)
+    src_ip = sub_info.get("alias_ip") or (ipv4_list[0]["ip"] if ipv4_list else "192.168.1.250")
+
+    found_macs = set()
+
+    # Проверяем кэш последнего сканирования на случай уже зафиксированных MAC
+    if os.path.exists(LAST_SCAN_CACHE):
+        try:
+            with open(LAST_SCAN_CACHE, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            for cam in cdata.get("cameras", []):
+                if cam.get("ip") == conflict_ip and cam.get("mac"):
+                    m_norm = normalize_mac(cam["mac"])
+                    if m_norm and m_norm not in local_macs:
+                        found_macs.add(m_norm)
+        except Exception:
+            pass
+
+    # Активный мульти-ARP опрос конфликтного IP
+    arp_req = Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") / ARP(
+        op=1, hwsrc=src_mac, psrc=src_ip, hwdst="00:00:00:00:00:00", pdst=conflict_ip
+    )
+    try:
+        ans, _ = srp([arp_req, arp_req, arp_req], iface=iface, timeout=2.0, multi=True, verbose=False)
+        for _, rcv in ans:
+            if rcv.haslayer(Ether) and rcv.haslayer(ARP):
+                if rcv[ARP].psrc == conflict_ip:
+                    m_norm = normalize_mac(rcv[Ether].src)
+                    if m_norm and m_norm not in local_macs:
+                        found_macs.add(m_norm)
+    except Exception:
+        pass
+
+    sorted_macs = sorted(found_macs)
+    if not sorted_macs:
+        print(f"\n{C.YELLOW}[РЕЗУЛЬТАТ]{C.RESET} На адресе {conflict_ip} не откликнулось ни одного устройства.")
+        return 1
+
+    print(f"  {C.GREEN}✔ Обнаружено устройств на {conflict_ip}:{C.RESET} {C.BOLD}{len(sorted_macs)}{C.RESET}")
+    for i, m in enumerate(sorted_macs, 1):
+        v = get_camera_vendor(m) or "Сетевое устройство"
+        print(f"    {i}. MAC: {C.YELLOW}{C.BOLD}{m.upper()}{C.RESET} ({C.MAGENTA}{v}{C.RESET})")
+
+    summary = []
+    for idx, target_mac in enumerate(sorted_macs):
+        assigned_ip = str(base_new_ip_obj + idx)
+        print(
+            f"\n{C.MAGENTA}{C.BOLD}>>> [КАМЕРА #{idx + 1}/{len(sorted_macs)}]{C.RESET} "
+            f"Перевод MAC {C.YELLOW}{target_mac.upper()}{C.RESET}: {conflict_ip} ➔ {C.GREEN}{C.BOLD}{assigned_ip}{C.RESET}"
+        )
+        rc = run_set_ip(
+            old_ip=conflict_ip,
+            new_ip=assigned_ip,
+            username=username,
+            password=password,
+            gateway=gateway,
+            target_mac=target_mac,
+        )
+        summary.append((target_mac.upper(), conflict_ip, assigned_ip, rc == 0))
+
+    print(f"\n{C.CYAN}{C.BOLD}══════════════════ СВОДКА РАЗВЕДЕНИЯ КОНФЛИКТА ══════════════════{C.RESET}")
+    for mac_u, o_ip, n_ip, ok in summary:
+        status_s = f"{C.GREEN}✔ УСПЕШНО{C.RESET}" if ok else f"{C.RED}✖ ОШИБКА/ТАЙМАУТ{C.RESET}"
+        print(f"  • MAC {C.YELLOW}{mac_u}{C.RESET}: {o_ip} ➔ {C.CYAN}{C.BOLD}{n_ip:<15}{C.RESET} [{status_s}]")
+    return 0
+
+
+# ==============================================================================
+# КОМАНДА CABLE: L1/L2 ДИАГНОСТИКА ФИЗИЧЕСКОГО КАБЕЛЯ И ОБЖИМА RJ-45 (agent_07)
+# ==============================================================================
+def parse_ping_output(stdout_text: str) -> dict:
+    """Извлекает процент потерь (loss) и статистику RTT (min, avg, max, mdev) из вывода ping."""
+    result = {
+        "loss": 100.0,
+        "min": 0.0,
+        "avg": 0.0,
+        "max": 0.0,
+        "mdev": 0.0,
+        "received": 0,
+    }
+    m_loss = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", stdout_text)
+    if not m_loss:
+        m_loss = re.search(r"(\d+(?:\.\d+)?)%\s*потерь", stdout_text)
+    if m_loss:
+        result["loss"] = float(m_loss.group(1))
+
+    m_rcv = re.search(r"(\d+)\s+received", stdout_text)
+    if m_rcv:
+        result["received"] = int(m_rcv.group(1))
+
+    m_rtt = re.search(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms", stdout_text)
+    if m_rtt:
+        result["min"] = float(m_rtt.group(1))
+        result["avg"] = float(m_rtt.group(2))
+        result["max"] = float(m_rtt.group(3))
+        result["mdev"] = float(m_rtt.group(4))
+    return result
+
+
+def run_cable_diag(target_ip: str) -> int:
+    try:
+        ipaddress.IPv4Address(target_ip)
+    except ValueError:
+        print(f"{C.RED}[ОШИБКА] Некорректный IPv4-адрес: {target_ip}{C.RESET}")
+        return 1
+
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE CABLE — L1/L2 Диагностика витой пары, обжима RJ-45 и PoE{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    sub_info = inject_subnet_alias(iface, target_ip)
+    print(f"{C.BOLD}[ЦЕЛЬ]{C.RESET}      {C.CYAN}{C.BOLD}{target_ip}{C.RESET} через {C.GREEN}{iface}{C.RESET} ({sub_info.get('status')})")
+
+    # 1. Тест стандартными пакетами 64 байта (56 байт payload + 8 байт ICMP заголовок)
+    print(f"\n{C.BLUE}[ТЕСТ 1/2]{C.RESET} Отправка 100 стандартных ICMP-пакетов (64 байта: `ping -c 100 -i 0.01 -s 56 -W 1 {target_ip}`)...")
+    res_small = run_cmd(["ping", "-c", "100", "-i", "0.01", "-s", "56", "-W", "1", target_ip])
+    stats_small = parse_ping_output(res_small.stdout)
+    print(
+        f"  ➔ Потери (64B)  : {C.BOLD}{stats_small['loss']:.1f}%{C.RESET} | "
+        f"RTT avg={stats_small['avg']:.2f} ms | max={stats_small['max']:.2f} ms | "
+        f"jitter (mdev)={C.BOLD}{stats_small['mdev']:.2f} ms{C.RESET}"
+    )
+
+    if stats_small["loss"] >= 100.0:
+        print(f"\n{C.RED}{C.BOLD}[ВЕРДИКТ: OFFLINE]{C.RESET} Узел {target_ip} полностью недоступен по ICMP (100% потерь на 64B).")
+        return 1
+
+    # 2. Тест тяжелыми пакетами 1472 байта (полный MTU 1500 без фрагментации)
+    print(f"\n{C.BLUE}[ТЕСТ 2/2]{C.RESET} Стресс-тест полного MTU 1500 (100 пакетов по 1472 байта: `ping -c 100 -i 0.01 -s 1472 -W 1 {target_ip}`)...")
+    res_heavy = run_cmd(["ping", "-c", "100", "-i", "0.01", "-s", "1472", "-W", "1", target_ip])
+    stats_heavy = parse_ping_output(res_heavy.stdout)
+    print(
+        f"  ➔ Потери (1472B): {C.BOLD}{stats_heavy['loss']:.1f}%{C.RESET} | "
+        f"RTT avg={stats_heavy['avg']:.2f} ms | max={stats_heavy['max']:.2f} ms | "
+        f"jitter (mdev)={C.BOLD}{stats_heavy['mdev']:.2f} ms{C.RESET}"
+    )
+
+    # Анализ деградации между 64B и 1472B
+    jitter_spike = (
+        stats_heavy["mdev"] > max(12.0, stats_small["mdev"] * 3.5)
+        or stats_heavy["avg"] > max(20.0, stats_small["avg"] * 4.0)
+    )
+    has_l1_defect = (stats_heavy["loss"] > 1.0) or (stats_small["loss"] > 1.0) or jitter_spike
+
+    print(f"\n{C.CYAN}{C.BOLD}════════════════════════ ИНЖЕНЕРНЫЙ ВЕРДИКТ ════════════════════════{C.RESET}")
+    if has_l1_defect:
+        print(
+            f"{C.RED}{C.BOLD}[L1 DEFECT] Проблема с физическим кабелем, плохим обжимом RJ-45 или просадкой питания PoE{C.RESET}"
+        )
+        if stats_small["loss"] == 0.0 and stats_heavy["loss"] > 1.0:
+            print(
+                f"  {C.YELLOW}• Диагноз:{C.RESET} Мелкие пакеты (64B) проходят без потерь (0%), но на полном MTU (1472B) "
+                f"теряется {stats_heavy['loss']:.1f}% кадров (типичный признак окисления контактов RJ-45, омедненки CCA или наводок)."
+            )
+        elif jitter_spike:
+            print(
+                f"  {C.YELLOW}• Диагноз:{C.RESET} Зафиксирован резкий скачок латентности/джиттера под нагрузкой "
+                f"(mdev {stats_small['mdev']:.2f} ms ➔ {stats_heavy['mdev']:.2f} ms)."
+            )
+        else:
+            print(
+                f"  {C.YELLOW}• Диагноз:{C.RESET} Зафиксированы потери пакетов (64B: {stats_small['loss']:.1f}%, 1472B: {stats_heavy['loss']:.1f}%)."
+            )
+    else:
+        print(
+            f"{C.GREEN}{C.BOLD}[L1 OK] Физический кабель, обжим RJ-45 и линия PoE в отличном состоянии!{C.RESET}\n"
+            f"  {C.DIM}Полный профиль MTU 1500 (1472B payload) держит нагрузку: потери {stats_heavy['loss']:.1f}%, mdev {stats_heavy['mdev']:.2f} ms.{C.RESET}"
+        )
+
+    return 0
+
+
+# ==============================================================================
+# КОМАНДА SCAN (И РЕЖИМ FAST ПО УМОЛЧАНИЮ): ДВУХУРОВНЕВЫЙ РАДАР СЕТИ (agent_06_radar)
+# ==============================================================================
+def get_default_gateway_macs(iface: str) -> set:
+    """Определяет MAC-адрес(а) шлюза по умолчанию, чтобы не принимать транзитный интернет-трафик за L2-камеру."""
+    gw_ips = set()
+    res = run_cmd(["ip", "-4", "route", "show", "default", "dev", iface])
+    if res.returncode == 0:
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if "via" in parts:
+                idx = parts.index("via")
+                if idx + 1 < len(parts):
+                    gw_ips.add(parts[idx + 1])
+
+    gw_macs = set()
+    try:
+        with open("/proc/net/arp", "r") as f:
+            for line in f.read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 6:
+                    ip_a, _, flags, mac_a, _, dev = parts[:6]
+                    if dev == iface and ip_a in gw_ips and flags != "0x0" and mac_a != "00:00:00:00:00:00":
+                        gw_macs.add(mac_a.lower())
+    except Exception:
+        pass
+    return gw_macs
+
+
+def run_radar_scan() -> int:
+    start_wall = time.time()
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  PROCAM RADAR — Двухуровневый радар сети (Кабель + Wi-Fi + L2){C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, is_wired, wired_ifaces, wifi_ifaces = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    # Собираем ВСЕ активные интерфейсы (и проводной Ethernet, и Wi-Fi одновременно!)
+    active_scan_ifaces = []
+    for w_if in wired_ifaces:
+        ensure_iface_up(w_if)
+        if get_carrier(w_if) and w_if not in active_scan_ifaces:
+            active_scan_ifaces.append(w_if)
+    for wf_if in wifi_ifaces:
+        ensure_iface_up(wf_if)
+        if get_carrier(wf_if) and wf_if not in active_scan_ifaces:
+            active_scan_ifaces.append(wf_if)
+    if not active_scan_ifaces:
+        active_scan_ifaces = [iface]
+
+    iface_descriptions = []
+    for a_if in active_scan_ifaces:
+        kind = "Кабель" if a_if in wired_ifaces else "Wi-Fi"
+        addrs = [x["ip"] for x in get_iface_ipv4_list(a_if) if not x["label"].endswith(":yeee")]
+        ip_lbl = addrs[0] if addrs else "L2 без IP"
+        iface_descriptions.append(f"{a_if} ({kind}: {ip_lbl})")
+
+    print(f"{C.BOLD}[АКТИВНЫЕ СЕТИ]{C.RESET} {C.GREEN}{C.BOLD}{' + '.join(iface_descriptions)}{C.RESET}")
+
+    local_macs, local_ips = get_all_local_macs_and_ips()
+    probe_src_ips = set(local_ips)
+    gw_macs = set()
+    for a_if in active_scan_ifaces:
+        gw_macs |= get_default_gateway_macs(a_if)
+
+    # Определяем основные подсети всех активных интерфейсов (исключая временные алиасы :yeee)
+    primary_nets = []
+    primary_net_by_iface = {}
+    primary_ip = None
+    for a_if in active_scan_ifaces:
+        p_addrs = [item for item in get_iface_ipv4_list(a_if) if not item["label"].endswith(":yeee")]
+        for item in p_addrs:
+            if not primary_ip:
+                primary_ip = item["ip"]
+            octs = item["ip"].split(".")
+            try:
+                net_obj = ipaddress.IPv4Network(f"{octs[0]}.{octs[1]}.{octs[2]}.0/24", strict=False)
+                if net_obj not in primary_nets:
+                    primary_nets.append(net_obj)
+                primary_net_by_iface.setdefault(a_if, []).append((net_obj, item["ip"]))
+            except ValueError:
+                pass
+
+    if primary_nets:
+        print(f"{C.BOLD}[УРОВЕНЬ А]{C.RESET} Родные подсети: {C.CYAN}{', '.join(str(n) for n in primary_nets)}{C.RESET}")
+    else:
+        print(f"{C.BOLD}[УРОВЕНЬ А]{C.RESET} {C.YELLOW}Основная IPv4-подсеть не назначена (прямой кабель L2 / чужие подсети){C.RESET}")
+    print(f"{C.BOLD}[УРОВЕНЬ Б]{C.RESET} L2-провокация ONVIF (:3702), Hikvision SADP (:37020), Dahua (:37810) + перехват чужих подсетей")
+
+    def is_in_primary_subnet(ip_str: str) -> bool:
+        if not primary_nets:
+            return False
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_str)
+            return any(ip_obj in net for net in primary_nets)
+        except ValueError:
+            return False
+
+    # Хранилище: ip -> dict[mac -> entry_dict]
+    nodes_by_ip = {}
+    lock = threading.Lock()
+    stop_sniff = threading.Event()
+
+    def record_host(ip_str: str, mac_str: str, meta: dict = None, is_l2_proto: bool = False, pkt_iface: str = None):
+        if not ip_str or ip_str in ("0.0.0.0", "255.255.255.255", "239.255.255.250", "239.255.255.251"):
+            return
+        if ip_str in probe_src_ips or ip_str.startswith(("127.", "224.", "239.")):
+            return
+        mac_str = (mac_str or "").lower()
+        if not mac_str or mac_str in local_macs or mac_str in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            return
+
+        meta = meta or {}
+        eff_iface = pkt_iface or iface
+        in_local = is_in_primary_subnet(ip_str)
+
+        # Игнорируем транзитные внешние интернет-пакеты, приходящие через MAC роутера
+        if not in_local and mac_str in gw_macs and not is_l2_proto and not is_camera_mac(mac_str):
+            return
+
+        vendor = meta.get("vendor") or get_camera_vendor(mac_str)
+        with lock:
+            mac_map = nodes_by_ip.setdefault(ip_str, {})
+            entry = mac_map.get(mac_str)
+            if not entry:
+                mac_map[mac_str] = {
+                    "ip": ip_str,
+                    "mac": mac_str,
+                    "vendor": vendor,
+                    "model": meta.get("model", ""),
+                    "serial": meta.get("serial", ""),
+                    "firmware": meta.get("firmware", ""),
+                    "ports": [],
+                    "is_local_subnet": in_local,
+                    "l2_discovery": is_l2_proto,
+                    "iface": eff_iface,
+                    "subnet_info": {},
+                }
+            else:
+                if vendor and not entry["vendor"]:
+                    entry["vendor"] = vendor
+                for k in ("model", "serial", "firmware"):
+                    if meta.get(k) and not entry.get(k):
+                        entry[k] = meta[k]
+                if is_l2_proto:
+                    entry["l2_discovery"] = True
+                if pkt_iface and pkt_iface in wired_ifaces:
+                    entry["iface"] = pkt_iface
+
+    # Поток 1: Сниффер Уровня Б и ARP по всем активным интерфейсам (Кабель + Wi-Fi)
+    def radar_pkt_callback(pkt):
+        if not pkt.haslayer(Ether):
+            return
+        s_mac = pkt[Ether].src.lower()
+        if s_mac in local_macs or s_mac == "ff:ff:ff:ff:ff:ff":
+            return
+
+        p_if = getattr(pkt, "sniffed_on", iface) or iface
+
+        if pkt.haslayer(ARP):
+            psrc = pkt[ARP].psrc
+            pdst = pkt[ARP].pdst
+            if psrc == "0.0.0.0" and pdst and pdst != "0.0.0.0" and pdst not in probe_src_ips:
+                record_host(pdst, s_mac, is_l2_proto=True, pkt_iface=p_if)
+            elif psrc and psrc != "0.0.0.0":
+                record_host(psrc, s_mac, is_l2_proto=not is_in_primary_subnet(psrc), pkt_iface=p_if)
+            return
+
+        if pkt.haslayer(IP):
+            src_ip = pkt[IP].src
+            parsed_meta = {}
+            is_proto = False
+            if pkt.haslayer(UDP) and pkt.haslayer(Raw):
+                sport = pkt[UDP].sport
+                dport = pkt[UDP].dport
+                if sport in (3702, 37020, 37810) or dport in (3702, 37020, 37810):
+                    parsed_meta = parse_xml_discovery_payload(bytes(pkt[Raw].load))
+                    is_proto = True
+
+            eff_ip = parsed_meta.get("ip") or src_ip
+            if is_proto or is_camera_mac(s_mac) or not is_in_primary_subnet(eff_ip):
+                record_host(eff_ip, s_mac, parsed_meta, is_l2_proto=is_proto, pkt_iface=p_if)
+
+    def sniffer_worker():
+        try:
+            sniff(
+                iface=active_scan_ifaces,
+                timeout=3.4,
+                store=False,
+                prn=radar_pkt_callback,
+                stop_filter=lambda _: stop_sniff.is_set(),
+            )
+        except Exception:
+            pass
+
+    # Поток 2: Отправка L2-провокаций (ONVIF, SADP, Dahua, ARP) на все активные интерфейсы
+    def l2_prover_worker():
+        time.sleep(0.1)
+        for a_if in active_scan_ifaces:
+            send_l2_provocations(a_if, probe_src_ips)
+        time.sleep(1.4)
+        if not stop_sniff.is_set():
+            for a_if in active_scan_ifaces:
+                send_l2_provocations(a_if, probe_src_ips)
+
+    # Поток 3: Асинхронный ARP-sweep по родным подсетям всех активных интерфейсов
+    def level_a_srp_worker():
+        for a_if, net_tuples in primary_net_by_iface.items():
+            src_mac = get_iface_mac(a_if)
+            for net_obj, src_ip_for_if in net_tuples:
+                targets = [str(h) for h in net_obj.hosts() if str(h) not in probe_src_ips]
+                if not targets:
+                    continue
+                pkt_batch = Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") / ARP(
+                    op=1, hwsrc=src_mac, psrc=src_ip_for_if, pdst=targets
+                )
+                try:
+                    ans, _ = srp(pkt_batch, iface=a_if, timeout=2.2, multi=True, verbose=False)
+                    for _, rcv in ans:
+                        if rcv.haslayer(Ether) and rcv.haslayer(ARP):
+                            record_host(rcv[ARP].psrc, rcv[Ether].src.lower(), is_l2_proto=False, pkt_iface=a_if)
+                except Exception:
+                    pass
+
+    print(f"\n{C.BLUE}{C.BOLD}[1/2] Параллельное сканирование Уровня А (/24) и Уровня Б (ONVIF/SADP/DHIP L2)...{C.RESET}")
+    t_sniff = threading.Thread(target=sniffer_worker, daemon=True)
+    t_l2 = threading.Thread(target=l2_prover_worker, daemon=True)
+    t_srp = threading.Thread(target=level_a_srp_worker, daemon=True)
+
+    t_sniff.start()
+    t_l2.start()
+    t_srp.start()
+
+    t_srp.join(timeout=3.0)
+    t_l2.join(timeout=3.2)
+    t_sniff.join(timeout=3.6)
+    stop_sniff.set()
+
+    # Инъекция мостов :yeee на том интерфейсе, где ответила камера (без разрыва Wi-Fi!)
+    all_ips = sorted(nodes_by_ip.keys())
+    subnet_status_by_ip = {}
+    for ip_str in all_ips:
+        mac_dict = nodes_by_ip[ip_str]
+        first_entry = next(iter(mac_dict.values()))
+        target_if = first_entry.get("iface") or iface
+        subnet_status_by_ip[ip_str] = inject_subnet_alias(target_if, ip_str)
+
+    # Параллельная проверка портов (80, 443, 554, 8000, 37777) для всех откликнувшихся хостов
+    print(f"{C.BLUE}{C.BOLD}[2/2] Проверка портов [80, 443, 554, 8000, 37777] на {len(all_ips)} откликнувшихся IP...{C.RESET}")
+    ports_by_ip = {}
+    if all_ips:
+        def _scan_ip_ports(ip_target: str) -> list:
+            open_p = []
+            with ThreadPoolExecutor(max_workers=len(TARGET_PORTS)) as inner_ex:
+                futs = {p: inner_ex.submit(check_single_port, ip_target, p, 0.55) for p in TARGET_PORTS}
+                for p in TARGET_PORTS:
+                    if futs[p].result():
+                        open_p.append(p)
+            return open_p
+
+        with ThreadPoolExecutor(max_workers=min(32, max(1, len(all_ips)))) as outer_ex:
+            ip_futures = {ip_str: outer_ex.submit(_scan_ip_ports, ip_str) for ip_str in all_ips}
+            for ip_str, fut in ip_futures.items():
+                ports_by_ip[ip_str] = fut.result()
+
+    # Формируем требуемую структуру: ip -> list of {mac, vendor, model, ports, is_local_subnet, ...}
+    ip_to_entries = {}
+    local_subnet_cameras = []
+    foreign_subnet_cameras = []
+    conflict_ips = {}
+    cache_cameras_list = []
+
+    CAMERA_SPECIFIC_PORTS = {554, 8000, 37777}
+
+    for ip_str in all_ips:
+        mac_dict = nodes_by_ip[ip_str]
+        open_ports = ports_by_ip.get(ip_str, [])
+        sub_info = subnet_status_by_ip.get(ip_str, {})
+        entries = []
+
+        for mac_str, item in mac_dict.items():
+            item["ports"] = open_ports
+            item["open_ports"] = open_ports
+            item["subnet_info"] = sub_info
+            item["iface"] = item.get("iface") or iface
+            enrich_camera_record(item)
+            entries.append(item)
+
+        ip_to_entries[ip_str] = entries
+        is_conflict = len(entries) >= 2
+
+        # Определяем, относится ли узел к камерам:
+        # Уровень А: открыт хотя бы один из 554, 8000, 37777 ИЛИ MAC производителя камер ИЛИ L2 ONVIF/SADP/DHIP ответ
+        # Уровень Б: любой обнаруженный узел из чужой подсети
+        has_cam_port = any(p in CAMERA_SPECIFIC_PORTS for p in open_ports)
+        any_cam_mac_or_l2 = any(is_camera_mac(e["mac"]) or e.get("l2_discovery") for e in entries)
+
+        if is_conflict:
+            conflict_ips[ip_str] = entries
+
+        for entry in entries:
+            entry["conflict"] = is_conflict
+            if entry["is_local_subnet"]:
+                if has_cam_port or is_camera_mac(entry["mac"]) or entry.get("l2_discovery"):
+                    local_subnet_cameras.append(entry)
+                    cache_cameras_list.append(entry)
+            else:
+                if has_cam_port or any_cam_mac_or_l2 or open_ports or not entry["is_local_subnet"]:
+                    foreign_subnet_cameras.append(entry)
+                    cache_cameras_list.append(entry)
+
+    save_last_scan_cache(iface, "scan", cache_cameras_list)
+    elapsed_total = time.time() - start_wall
+
+    # ==========================================================================
+    # НАГЛЯДНЫЙ РАЗДЕЛЬНЫЙ ВЫВОД В ТЕРМИНАЛ (3 ЧЕТКИЕ СЕКЦИИ)
+    # ==========================================================================
+    print(f"\n{C.CYAN}{C.BOLD}════════════════════════ РЕЗУЛЬТАТЫ РАДАРА ({elapsed_total:.1f} сек) ════════════════════════{C.RESET}")
+
+    # СЕКЦИЯ 1: КАМЕРЫ В ТВОЕЙ ПОДСЕТИ
+    print(f"\n{C.GREEN}{C.BOLD}[🟢 КАМЕРЫ В ТВОЕЙ ПОДСЕТИ (Родная сеть роутера)]{C.RESET}")
+    if not local_subnet_cameras:
+        print(f"  {C.DIM}В основной подсети ({', '.join(str(n) for n in primary_nets) or 'нет'}) IP-камер не обнаружено.{C.RESET}")
+    else:
+        for cam in local_subnet_cameras:
+            c_badge = f" {C.RED}{C.BOLD}[КОНФЛИКТ IP!]{C.RESET}" if cam.get("conflict") else ""
+            ports_s = ", ".join(str(p) for p in cam["ports"]) if cam["ports"] else "нет открытых"
+            model_s = f" | Модель: {cam['model']}" if cam.get("model") and not cam["model"].startswith("Н/Д") else ""
+            print(
+                f"  {C.GREEN}●{C.RESET} IP: {C.CYAN}{C.BOLD}{cam['ip']:<15}{C.RESET}{c_badge} | "
+                f"MAC: {C.YELLOW}{cam['mac_upper']}{C.RESET} | "
+                f"Бренд: {C.MAGENTA}{C.BOLD}{cam['vendor_resolved']}{C.RESET}{model_s}\n"
+                f"    Порты: [{ports_s}] | Веб: {C.BLUE}{C.BOLD}{cam['web_link']}{C.RESET} | RTSP: {C.CYAN}{cam['rtsp_link']}{C.RESET}"
+            )
+
+    # СЕКЦИЯ 2: КАМЕРЫ В ЧУЖОЙ ПОДСЕТИ
+    print(f"\n{C.YELLOW}{C.BOLD}[🟡 КАМЕРЫ В ЧУЖОЙ ПОДСЕТИ (Доступ прокинут через алиас)]{C.RESET}")
+    if not foreign_subnet_cameras:
+        print(f"  {C.DIM}Устройств в чужих подсетях не обнаружено.{C.RESET}")
+    else:
+        for cam in foreign_subnet_cameras:
+            c_badge = f" {C.RED}{C.BOLD}[КОНФЛИКТ IP!]{C.RESET}" if cam.get("conflict") else ""
+            ports_s = ", ".join(str(p) for p in cam["ports"]) if cam["ports"] else "нет открытых"
+            alias_s = cam.get("subnet_info", {}).get("status", "-")
+            model_s = f" | Модель: {cam['model']}" if cam.get("model") and not cam["model"].startswith("Н/Д") else ""
+            print(
+                f"  {C.YELLOW}●{C.RESET} IP: {C.CYAN}{C.BOLD}{cam['ip']:<15}{C.RESET}{c_badge} | "
+                f"MAC: {C.YELLOW}{cam['mac_upper']}{C.RESET} | "
+                f"Бренд: {C.MAGENTA}{C.BOLD}{cam['vendor_resolved']}{C.RESET}{model_s}\n"
+                f"    Алиас : {C.GREEN}{alias_s}{C.RESET}\n"
+                f"    Порты : [{ports_s}] | Веб: {C.BLUE}{C.BOLD}{cam['web_link']}{C.RESET} | RTSP: {C.CYAN}{cam['rtsp_link']}{C.RESET}"
+            )
+
+    # СЕКЦИЯ 3: КАМЕРЫ НА ОДНОМ И ТОМ ЖЕ IP (Конфликт адресов)
+    print(f"\n{C.RED}{C.BOLD}[🔴 КАМЕРЫ НА ОДНОМ И ТОМ ЖЕ IP (Конфликт адресов)]{C.RESET}")
+    if not conflict_ips:
+        print(f"  {C.GREEN}✔ Конфликтов IP-адресов не обнаружено (каждый IP принадлежит уникальному MAC).{C.RESET}")
+    else:
+        for cip, entries in conflict_ips.items():
+            print(f"  {C.RED}{C.BOLD}⚠ [КОНФЛИКТ IP!] На адресе {cip} обнаружено сразу {len(entries)} устройств(а):{C.RESET}")
+            for e in entries:
+                print(f"    {C.RED}➔{C.RESET} MAC: {C.YELLOW}{C.BOLD}{e['mac_upper']}{C.RESET} — {C.MAGENTA}{e['vendor_resolved']}{C.RESET} ({e.get('model', 'Н/Д')})")
+            print(
+                f"    {C.YELLOW}{C.BOLD}Рекомендация:{C.RESET} Временно отключите одну из конфликтных камер от свитча/роутера "
+                f"и смените IP оставшейся через:\n"
+                f"    {C.WHITE}{C.BOLD}yeee set-ip {cip} <НОВЫЙ_IP> admin <ПАРОЛЬ>{C.RESET}"
+            )
+
+    print(f"\n{C.DIM}Подсказка: `yeee open <IP>` — открыть камеру в браузере | `yeee dump` — сохранить отчет | `yeee clean` — убрать алиасы{C.RESET}")
+    return 0
+
+
+# ==============================================================================
+# PRO SUITE ФУНКЦИИ: INFO, FREE, PLAY, SNAP, ACTIVATE, WATCH (agent_08_pro_suite)
+# ==============================================================================
+def run_info_camera(target_ip: str) -> int:
+    """Глубокая беспарольная инспекция камеры: ONVIF-часы, статус активации, RTSP-баннер, SSL-сертификат."""
+    try:
+        ipaddress.IPv4Address(target_ip)
+    except ValueError:
+        print(f"{C.RED}[ОШИБКА] Некорректный IPv4-адрес: {target_ip}{C.RESET}")
+        return 1
+
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE INFO — Глубокая инспекция узла {target_ip} БЕЗ пароля{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    sub_info = inject_subnet_alias(iface, target_ip)
+    open_ports = scan_camera_ports(target_ip)
+
+    # 1. Получаем MAC-адрес из ARP или через srp
+    mac_found = ""
+    src_mac = get_iface_mac(iface)
+    ipv4_list = get_iface_ipv4_list(iface)
+    src_ip = sub_info.get("alias_ip") or (ipv4_list[0]["ip"] if ipv4_list else "192.168.1.250")
+    try:
+        ans, _ = srp(
+            Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, hwsrc=src_mac, psrc=src_ip, pdst=target_ip),
+            iface=iface,
+            timeout=1.0,
+            verbose=False,
+        )
+        for _, rcv in ans:
+            if rcv.haslayer(Ether):
+                mac_found = rcv[Ether].src.lower()
+                break
+    except Exception:
+        pass
+
+    vendor = get_camera_vendor(mac_found) if mac_found else "Не определен по OUI"
+
+    # 2. Беспарольный запрос ONVIF GetSystemDateAndTime
+    onvif_time_str = "Не поддерживает / закрыт"
+    drift_str = "-"
+    if requests and (80 in open_ports or 8000 in open_ports or 443 in open_ports):
+        soap_dt = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            "<s:Body><tds:GetSystemDateAndTime/></s:Body></s:Envelope>"
+        )
+        try:
+            r = requests.post(
+                f"http://{target_ip}/onvif/device_service",
+                data=soap_dt,
+                headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+                timeout=1.8,
+            )
+            if r.status_code == 200 and "UTCDateTime" in r.text:
+                m_yr = re.search(r"<(?:\w+:)?Year>(\d+)</(?:\w+:)?Year>", r.text)
+                m_mo = re.search(r"<(?:\w+:)?Month>(\d+)</(?:\w+:)?Month>", r.text)
+                m_da = re.search(r"<(?:\w+:)?Day>(\d+)</(?:\w+:)?Day>", r.text)
+                m_hr = re.search(r"<(?:\w+:)?Hour>(\d+)</(?:\w+:)?Hour>", r.text)
+                m_mi = re.search(r"<(?:\w+:)?Minute>(\d+)</(?:\w+:)?Minute>", r.text)
+                m_se = re.search(r"<(?:\w+:)?Second>(\d+)</(?:\w+:)?Second>", r.text)
+                if all([m_yr, m_mo, m_da, m_hr, m_mi, m_se]):
+                    cam_utc = datetime(
+                        int(m_yr.group(1)),
+                        int(m_mo.group(1)),
+                        int(m_da.group(1)),
+                        int(m_hr.group(1)),
+                        int(m_mi.group(1)),
+                        int(m_se.group(1)),
+                        tzinfo=timezone.utc,
+                    )
+                    now_utc = datetime.now(timezone.utc)
+                    diff_sec = int((cam_utc - now_utc).total_seconds())
+                    onvif_time_str = cam_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if abs(diff_sec) <= 5:
+                        drift_str = f"{C.GREEN}Норма (расхождение {diff_sec:+d} сек){C.RESET}"
+                    else:
+                        drift_str = f"{C.RED}{C.BOLD}СБИТЫ ЧАСЫ! Расхождение {diff_sec:+d} сек (настройте NTP){C.RESET}"
+        except Exception:
+            pass
+
+    # 3. Проверка статуса активации и HTTP заголовков
+    http_server = "-"
+    activation_status = "Неизвестно"
+    if requests and (80 in open_ports or 443 in open_ports):
+        scheme = "https" if (443 in open_ports and 80 not in open_ports) else "http"
+        try:
+            r_root = requests.get(f"{scheme}://{target_ip}/", timeout=1.5, verify=False)
+            http_server = r_root.headers.get("Server", "-")
+        except Exception:
+            pass
+        try:
+            r_act = requests.get(f"{scheme}://{target_ip}/SDK/activateStatus", timeout=1.5, verify=False)
+            if "<Activated>false</Activated>" in r_act.text:
+                activation_status = f"{C.YELLOW}{C.BOLD}INACTIVE (Новая с завода — пароля еще НЕТ!){C.RESET}"
+            elif "<Activated>true</Activated>" in r_act.text:
+                activation_status = f"{C.GREEN}ACTIVE (Активирована, установлен пароль){C.RESET}"
+        except Exception:
+            pass
+
+    # 4. Опрос RTSP OPTIONS на порту 554
+    rtsp_banner = "-"
+    if 554 in open_ports:
+        try:
+            with socket.create_connection((target_ip, 554), timeout=1.2) as s:
+                req = f"OPTIONS rtsp://{target_ip}:554/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: YEEE-Pro\r\n\r\n"
+                s.sendall(req.encode("ascii"))
+                data = s.recv(1024).decode("utf-8", errors="ignore")
+                m_srv = re.search(r"Server:\s*([^\r\n]+)", data, re.I)
+                if m_srv:
+                    rtsp_banner = m_srv.group(1).strip()
+                else:
+                    first_line = data.splitlines()[0] if data.splitlines() else ""
+                    rtsp_banner = first_line
+        except Exception:
+            pass
+
+    # 5. Извлечение Subject из SSL-сертификата на порту 443
+    tls_subject = "-"
+    if 443 in open_ports:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((target_ip, 443), timeout=1.5) as sock:
+                with ctx.wrap_socket(sock, server_hostname=target_ip) as ssock:
+                    der_cert = ssock.getpeercert(binary_form=True)
+                    if der_cert:
+                        pem = ssl.DER_cert_to_PEM_cert(der_cert)
+                        p_res = subprocess.run(
+                            ["openssl", "x509", "-noout", "-subject"],
+                            input=pem,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        if p_res.returncode == 0 and p_res.stdout.strip():
+                            tls_subject = p_res.stdout.strip().replace("subject=", "").strip()
+        except Exception:
+            pass
+
+    ports_s = ", ".join(str(p) for p in open_ports) if open_ports else "Нет открытых из [80, 443, 8000, 554, 37777]"
+    print(f"  {C.BOLD}IP-адрес          :{C.RESET} {C.CYAN}{C.BOLD}{target_ip}{C.RESET} ({sub_info.get('status')})")
+    print(f"  {C.BOLD}MAC-адрес         :{C.RESET} {C.YELLOW}{mac_found.upper() if mac_found else 'Н/Д (не в L2/ARP)'}{C.RESET}")
+    print(f"  {C.BOLD}Вендор (OUI)      :{C.RESET} {C.MAGENTA}{vendor}{C.RESET}")
+    print(f"  {C.BOLD}Открытые порты    :{C.RESET} {ports_s}")
+    print(f"  {C.BOLD}Статус активации  :{C.RESET} {activation_status}")
+    print(f"  {C.BOLD}HTTP Server       :{C.RESET} {http_server}")
+    print(f"  {C.BOLD}RTSP Banner (:554):{C.RESET} {rtsp_banner}")
+    print(f"  {C.BOLD}TLS Сертификат    :{C.RESET} {tls_subject}")
+    print(f"  {C.BOLD}Часы камеры (ONVIF):{C.RESET} {onvif_time_str}")
+    print(f"  {C.BOLD}Синхронизация NTP :{C.RESET} {drift_str}")
+    return 0
+
+
+def run_free_ips(count: int = 10, target_subnet: str = None) -> int:
+    """
+    Сканирует /24 подсеть и выдает гарантированно свободный пул из count IP-адресов под камеры.
+    Корректно работает даже когда одновременно подключены кабель (без DHCP) и Wi-Fi роутер!
+    """
+    count = max(1, min(245, int(count)))
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  PROCAM RADAR — Подбор {count} свободных IP-адресов для монтажа камер{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, _, wired_ifaces, wifi_ifaces = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    # Ищем интерфейс с активной IPv4-подсетью (если кабель воткнут напрямую в камеру без роутера — берем подсеть Wi-Fi роутера)
+    primary_addrs = [item for item in get_iface_ipv4_list(iface) if not item["label"].endswith(":yeee")]
+    if not primary_addrs:
+        for candidate_if in wifi_ifaces + wired_ifaces:
+            cand_addrs = [item for item in get_iface_ipv4_list(candidate_if) if not item["label"].endswith(":yeee")]
+            if cand_addrs:
+                iface = candidate_if
+                primary_addrs = cand_addrs
+                break
+
+    if target_subnet:
+        octs = target_subnet.split("/")[0].split(".")
+        if len(octs) >= 3:
+            prefix_24 = f"{octs[0]}.{octs[1]}.{octs[2]}"
+            my_ip = primary_addrs[0]["ip"] if primary_addrs else f"{prefix_24}.250"
+        else:
+            print(f"{C.RED}[ОШИБКА] Некорректный формат подсети: {target_subnet}{C.RESET}")
+            return 1
+    elif primary_addrs:
+        my_ip = primary_addrs[0]["ip"]
+        octs = my_ip.split(".")
+        prefix_24 = f"{octs[0]}.{octs[1]}.{octs[2]}"
+    else:
+        prefix_24 = "192.168.1"
+        my_ip = "192.168.1.250"
+        inject_subnet_alias(iface, "192.168.1.1")
+
+    net_cidr = f"{prefix_24}.0/24"
+    net_obj = ipaddress.IPv4Network(net_cidr, strict=False)
+
+    print(f"{C.BOLD}[ПОДСЕТЬ]{C.RESET} {C.GREEN}{net_cidr}{C.RESET} на интерфейсе {C.BOLD}{iface}{C.RESET} (ваш IP: {my_ip})")
+    print(f"{C.BOLD}[ЗАПРОС]{C.RESET}  Необходимо свободных IP-адресов: {C.CYAN}{C.BOLD}{count}{C.RESET}")
+    print(f"{C.BLUE}[СКАН]{C.RESET}    Проверка всех 254 адресов (ARP-опрос + проверка портов)...")
+
+    occupied = {my_ip, f"{prefix_24}.1", f"{prefix_24}.250", f"{prefix_24}.249", f"{prefix_24}.248"}
+    src_mac = get_iface_mac(iface)
+
+    # 1. Быстрый ARP-sweep через Scapy srp
+    targets = [str(h) for h in net_obj.hosts() if str(h) != my_ip]
+    try:
+        ans, _ = srp(
+            Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, hwsrc=src_mac, psrc=my_ip, pdst=targets),
+            iface=iface,
+            timeout=1.8,
+            verbose=False,
+        )
+        for _, rcv in ans:
+            if rcv.haslayer(ARP):
+                occupied.add(rcv[ARP].psrc)
+    except Exception:
+        pass
+
+    free_all = [f"{prefix_24}.{i}" for i in range(2, 248) if f"{prefix_24}.{i}" not in occupied]
+    preferred = [f"{prefix_24}.{i}" for i in range(100, 245) if f"{prefix_24}.{i}" not in occupied]
+
+    # Ищем непрерывный блок из count адресов
+    best_block = []
+    search_pool = preferred if len(preferred) >= count else free_all
+    cur_block = []
+    prev_last = None
+    for ip_s in search_pool:
+        last_oct = int(ip_s.split(".")[-1])
+        if prev_last is None or last_oct == prev_last + 1:
+            cur_block.append(ip_s)
+        else:
+            cur_block = [ip_s]
+        prev_last = last_oct
+        if len(cur_block) == count:
+            best_block = list(cur_block)
+            break
+
+    if not best_block:
+        best_block = search_pool[:count]
+
+    print(f"\n  {C.GREEN}✔ Занято адресов в подсети :{C.RESET} {len(occupied)}")
+    print(f"  {C.GREEN}✔ Всего свободно адресов   :{C.RESET} {len(free_all)}")
+    if best_block:
+        print(
+            f"\n{C.GREEN}{C.BOLD}🎯 РЕКОМЕНДУЕМЫЙ СВОБОДНЫЙ ДИАПАЗОН ДЛЯ {len(best_block)} КАМЕР:{C.RESET}\n"
+            f"   {C.CYAN}{C.BOLD}{best_block[0]}  ──►  {best_block[-1]}{C.RESET} (Маска: 255.255.255.0 | Шлюз: {prefix_24}.1)"
+        )
+        print(f"   {C.DIM}Список ({len(best_block)} шт.): {', '.join(best_block)}{C.RESET}")
+    return 0
+
+
+def run_play_camera(target_ip: str, username: str = None, password: str = None, sub_stream: bool = False) -> int:
+    """Открывает живой RTSP-видеопоток камеры в окне ffplay / mpv / vlc от имени $SUDO_USER."""
+    try:
+        ipaddress.IPv4Address(target_ip)
+    except ValueError:
+        print(f"{C.RED}[ОШИБКА] Некорректный IPv4-адрес: {target_ip}{C.RESET}")
+        return 1
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    inject_subnet_alias(iface, target_ip)
+    open_ports = scan_camera_ports(target_ip)
+    u = username if username is not None else "admin"
+    p = password if password is not None else "admin"
+
+    channel = "102" if sub_stream else "101"
+    subtype = "1" if sub_stream else "0"
+    if 37777 in open_ports:
+        rtsp_url = f"rtsp://{u}:{p}@{target_ip}:554/cam/realmonitor?channel=1&subtype={subtype}"
+    else:
+        rtsp_url = f"rtsp://{u}:{p}@{target_ip}:554/Streaming/Channels/{channel}"
+
+    player_cmd = None
+    if shutil.which("ffplay"):
+        player_cmd = ["ffplay", "-rtsp_transport", "tcp", "-window_title", f"YEEE LIVE: {target_ip}", rtsp_url]
+    elif shutil.which("mpv"):
+        player_cmd = ["mpv", "--rtsp-transport=tcp", f"--title=YEEE LIVE: {target_ip}", rtsp_url]
+    elif shutil.which("vlc"):
+        player_cmd = ["vlc", rtsp_url]
+
+    if not player_cmd:
+        print(f"{C.RED}[ОШИБКА] Видеоплеер (ffplay / mpv / vlc) не найден. Установите: sudo apt install ffmpeg{C.RESET}")
+        return 1
+
+    print(f"{C.CYAN}{C.BOLD}[YEEE PLAY]{C.RESET} Запуск видеопотока {C.BOLD}{rtsp_url}{C.RESET} ({player_cmd[0]})...")
+    ok = run_gui_as_sudo_user(player_cmd)
+    return 0 if ok else 1
+
+
+def run_snap_camera(target_ip: str, username: str = None, password: str = None) -> int:
+    """Захватывает JPEG-снапшот с камеры (HTTP ISAPI / Dahua CGI / RTSP ffmpeg) и привязывает его к отчету."""
+    try:
+        ipaddress.IPv4Address(target_ip)
+    except ValueError:
+        print(f"{C.RED}[ОШИБКА] Некорректный IPv4-адрес: {target_ip}{C.RESET}")
+        return 1
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    inject_subnet_alias(iface, target_ip)
+    creds = [(username, password)] if (username is not None and password is not None) else DEFAULT_CREDENTIAL_CANDIDATES
+    out_file = os.path.join(os.getcwd(), f"snap_{target_ip.replace('.', '_')}.jpg")
+
+    print(f"{C.CYAN}{C.BOLD}[YEEE SNAP]{C.RESET} Захват стоп-кадра с камеры {C.BOLD}{target_ip}{C.RESET}...")
+    saved = False
+
+    # 1. Пробуем HTTP Snapshot API (Hikvision ISAPI / Dahua CGI)
+    if requests:
+        endpoints = [
+            f"http://{target_ip}/ISAPI/Streaming/channels/101/picture",
+            f"http://{target_ip}/cgi-bin/snapshot.cgi",
+            f"http://{target_ip}/onvif-http/snapshot?Profile_1",
+        ]
+        for u, p in creds:
+            for url in endpoints:
+                try:
+                    r = requests.get(url, auth=HTTPDigestAuth(u, p), timeout=2.5, verify=False)
+                    if r.status_code == 200 and r.content[:2] == b"\xff\xd8":
+                        with open(out_file, "wb") as f:
+                            f.write(r.content)
+                        saved = True
+                        break
+                except Exception:
+                    pass
+            if saved:
+                break
+
+    # 2. Fallback через ffmpeg RTSP
+    if not saved and shutil.which("ffmpeg"):
+        for u, p in creds[:3]:
+            for rtsp_path in (
+                f"rtsp://{u}:{p}@{target_ip}:554/Streaming/Channels/101",
+                f"rtsp://{u}:{p}@{target_ip}:554/cam/realmonitor?channel=1&subtype=0",
+            ):
+                res = run_cmd([
+                    "ffmpeg", "-y", "-rtsp_transport", "tcp",
+                    "-i", rtsp_path,
+                    "-frames:v", "1", "-q:v", "2", out_file,
+                ])
+                if res.returncode == 0 and os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+                    saved = True
+                    break
+            if saved:
+                break
+
+    if not saved:
+        print(f"  {C.RED}✖ Не удалось получить кадр с {target_ip} (проверьте доступность камеры и логин/пароль).{C.RESET}")
+        return 1
+
+    owner = chown_to_sudo_user(out_file)
+    # Обновляем путь снапшота в LAST_SCAN_CACHE для автоматической вставки в PDF
+    if os.path.exists(LAST_SCAN_CACHE):
+        try:
+            with open(LAST_SCAN_CACHE, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            for cam in cdata.get("cameras", []):
+                if cam.get("ip") == target_ip:
+                    cam["snapshot_path"] = out_file
+            with open(LAST_SCAN_CACHE, "w", encoding="utf-8") as f:
+                json.dump(cdata, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    print(f"  {C.GREEN}✔ Кадр сохранен:{C.RESET} {C.BOLD}{out_file}{C.RESET} (владелец: {C.CYAN}{owner}{C.RESET})")
+    return 0
+
+
+def run_activate_cameras(new_password: str, start_ip: str = None) -> int:
+    """
+    Пакетная активация новых камер «из коробки» (Hikvision 192.168.1.64 / Dahua 192.168.1.108):
+    Изолирует каждую по MAC через ip neigh replace, отправляет пакет активации и при указании START_IP раздает новые IP.
+    """
+    if len(new_password) < 8:
+        print(f"{C.YELLOW}[!] Внимание: рекомендуется пароль от 8 символов с буквами и цифрами (требование Hikvision/Dahua).{C.RESET}")
+
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE ACTIVATE — Пакетная активация новых камер «из коробки»{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, _, _, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    factory_ips = ["192.168.1.64", "192.168.1.108", "192.168.0.64", "192.168.1.100"]
+    for f_ip in factory_ips:
+        inject_subnet_alias(iface, f_ip)
+
+    src_mac = get_iface_mac(iface)
+    local_macs, _ = get_all_local_macs_and_ips()
+    targets = []  # list of (ip, mac)
+
+    for f_ip in factory_ips:
+        octs = f_ip.split(".")
+        probe_ip = f"{octs[0]}.{octs[1]}.{octs[2]}.250"
+        try:
+            ans, _ = srp(
+                Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, hwsrc=src_mac, psrc=probe_ip, pdst=f_ip),
+                iface=iface,
+                timeout=1.0,
+                multi=True,
+                verbose=False,
+            )
+            for _, rcv in ans:
+                if rcv.haslayer(Ether) and rcv.haslayer(ARP):
+                    m = normalize_mac(rcv[Ether].src)
+                    if m and m not in local_macs and (f_ip, m) not in targets:
+                        targets.append((f_ip, m))
+        except Exception:
+            pass
+
+    if not targets:
+        print(f"{C.YELLOW}[РЕЗУЛЬТАТ]{C.RESET} Камер на заводских адресах ({', '.join(factory_ips)}) не обнаружено.")
+        return 0
+
+    print(f"  {C.GREEN}✔ Найдено камер на заводских IP:{C.RESET} {len(targets)}")
+    base_ip_obj = ipaddress.IPv4Address(start_ip) if start_ip else None
+
+    for idx, (cam_ip, cam_mac) in enumerate(targets):
+        print(f"\n{C.MAGENTA}{C.BOLD}>>> Активация #{idx + 1}: IP={cam_ip} | MAC={cam_mac.upper()}{C.RESET}")
+        run_cmd(["ip", "neigh", "replace", cam_ip, "lladdr", cam_mac, "nud", "permanent", "dev", iface])
+        try:
+            if requests:
+                act_xml = f'<?xml version="1.0" encoding="UTF-8"?><ActivateInfo><password>{new_password}</password></ActivateInfo>'
+                try:
+                    r = requests.put(
+                        f"http://{cam_ip}/ISAPI/System/activate",
+                        data=act_xml.encode("utf-8"),
+                        headers={"Content-Type": "application/xml"},
+                        timeout=3.0,
+                        verify=False,
+                    )
+                    if r.status_code == 200 or "OK" in r.text:
+                        print(f"  {C.GREEN}✔ Камера {cam_mac.upper()} успешно активирована через ISAPI!{C.RESET}")
+                    else:
+                        print(f"  {C.YELLOW}➔ Ответ активации HTTP {r.status_code} (возможно, уже активирована).{C.RESET}")
+                except Exception as exc:
+                    print(f"  {C.DIM}➔ Ошибка запроса активации: {type(exc).__name__}{C.RESET}")
+        finally:
+            run_cmd(["ip", "neigh", "del", cam_ip, "dev", iface])
+
+        if base_ip_obj:
+            assigned_ip = str(base_ip_obj + idx)
+            run_set_ip(cam_ip, assigned_ip, "admin", new_password, target_mac=cam_mac)
+
+    return 0
+
+
+def emit_sound_beep() -> None:
+    """Подает звуковой сигнал терминала и системной аудиокарты при обнаружении камеры в режиме watch."""
+    sys.stdout.write("\a")
+    sys.stdout.flush()
+    for sound_file in (
+        "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        "/usr/share/sounds/freedesktop/stereo/bell.oga",
+    ):
+        if os.path.exists(sound_file) and shutil.which("paplay"):
+            run_gui_as_sudo_user(["paplay", sound_file])
+            break
+
+
+def run_watch_mode() -> int:
+    """Режим «Монтажник на стремянке»: непрерывный мониторинг со звуковым оповещением и авто-проверкой кабеля."""
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  YEEE WATCH — Режим «Монтажник на стремянке» (Аудио-маяк + Авто-тест){C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+
+    try:
+        iface, _, wired_ifaces, _ = discover_interfaces()
+    except RuntimeError as exc:
+        print(f"{C.RED}[ОШИБКА] {exc}{C.RESET}")
+        return 1
+
+    local_macs, local_ips = get_all_local_macs_and_ips()
+    baseline_macs, baseline_ips = calibrate_baseline(iface, local_macs, local_ips)
+    seen_macs = set(baseline_macs)
+    probe_src_ips = set(local_ips)
+
+    print(f"\n{C.GREEN}{C.BOLD}[МОНИТОРИНГ АКТИВЕН]{C.RESET} Подключайте камеры к свитчу/ноутбуку. Нажмите {C.BOLD}Ctrl+C{C.RESET} для выхода.\n")
+
+    def watch_pkt_handler(pkt):
+        if not pkt.haslayer(Ether):
+            return
+        s_mac = pkt[Ether].src.lower()
+        if s_mac in seen_macs or s_mac == "ff:ff:ff:ff:ff:ff":
+            return
+
+        ip_cand = None
+        if pkt.haslayer(ARP) and pkt[ARP].psrc != "0.0.0.0":
+            ip_cand = pkt[ARP].psrc
+        elif pkt.haslayer(IP) and pkt[IP].src not in ("0.0.0.0", "255.255.255.255"):
+            ip_cand = pkt[IP].src
+
+        if not ip_cand or ip_cand in probe_src_ips:
+            return
+
+        seen_macs.add(s_mac)
+        emit_sound_beep()
+        ts = datetime.now().strftime("%H:%M:%S")
+        vendor = get_camera_vendor(s_mac) or "Новое устройство"
+        sub_info = inject_subnet_alias(iface, ip_cand)
+        res_mtu = run_cmd(["ping", "-c", "10", "-i", "0.02", "-s", "1472", "-W", "1", ip_cand])
+        mtu_stats = parse_ping_output(res_mtu.stdout)
+        cable_str = (
+            f"{C.GREEN}КАБЕЛЬ OK (1472B loss 0%){C.RESET}"
+            if mtu_stats["loss"] == 0.0
+            else f"{C.RED}ПОТЕРИ MTU 1472B: {mtu_stats['loss']:.0f}%{C.RESET}"
+        )
+        print(
+            f"  🔔 [{ts}] {C.GREEN}{C.BOLD}НОВАЯ ТОЧКА!{C.RESET} IP={C.CYAN}{C.BOLD}{ip_cand}{C.RESET} | "
+            f"MAC={C.YELLOW}{s_mac.upper()}{C.RESET} ({C.MAGENTA}{vendor}{C.RESET}) | {cable_str} | {sub_info.get('status')}"
+        )
+
+    try:
+        while True:
+            send_l2_provocations(iface, probe_src_ips)
+            sniff(iface=iface, timeout=2.5, store=False, prn=watch_pkt_handler)
+    except KeyboardInterrupt:
+        print(f"\n{C.YELLOW}[ВЫХОД]{C.RESET} Мониторинг `yeee watch` завершен.")
+    return 0
+
+
+# ==============================================================================
+# СПРАВКА И ТОЧКА ВХОДА CLI
+# ==============================================================================
+def print_help() -> None:
+    help_text = f"""{C.CYAN}{C.BOLD}yeee v{VERSION}{C.RESET} — Полевой комбайн поиска, диагностики и настройки IP-камер
+
+{C.BOLD}ПОИСК И МОНИТОРИНГ:{C.RESET}
+  {C.GREEN}yeee gui{C.RESET}                                                       Запустить графическую программу YEEE Pro Suite GUI (Tkinter)
+  {C.GREEN}yeee{C.RESET}                                                           Интерактивный режим «Отключи -> Подключи» (ожидание до 30 сек)
+  {C.GREEN}yeee scan{C.RESET} (или {C.GREEN}yeee fast{C.RESET})                                      Полный двухуровневый радар сети (своя /24 + чужие L2 + коллизии IP)
+  {C.GREEN}yeee watch{C.RESET}                                                     Режим «Монтажник на стремянке» (звуковой маяк + авто-проверка MTU)
+  {C.GREEN}yeee free [COUNT]{C.RESET}                                              Найти пул гарантированно свободных IP в подсети под новые камеры
+
+{C.BOLD}ДИАГНОСТИКА И ИНСПЕКЦИЯ БЕЗ ПАРОЛЯ:{C.RESET}
+  {C.GREEN}yeee info <IP>{C.RESET}                                                 Инспекция без пароля: статус активации, часы ONVIF, RTSP/SSL баннеры
+  {C.GREEN}yeee cable <IP>{C.RESET}                                                L1/L2 тест физического кабеля, обжима RJ-45 и PoE (64B vs 1472B MTU 1500)
+  {C.GREEN}yeee conflict{C.RESET}                                                  Активный ARP-сканер дубликатов IP ([CRITICAL] IP CONFLICT DETECTED)
+
+{C.BOLD}УПРАВЛЕНИЕ, ВИДЕО И РАЗВЕДЕНИЕ КОЛЛИЗИЙ:{C.RESET}
+  {C.GREEN}yeee open <IP> [--mac <MAC>]{C.RESET}                                   Прокинуть подсеть, изолировать по MAC (без пароля) и открыть браузер
+  {C.GREEN}yeee play <IP> [USER] [PASS] [--sub]{C.RESET}                           Открыть живой RTSP-поток в плеере (ffplay / mpv / vlc)
+  {C.GREEN}yeee snap <IP> [USER] [PASS]{C.RESET}                                   Снять JPEG-кадр с камеры (и прикрепить к PDF-отчету)
+  {C.GREEN}yeee activate <NEW_PASS> [START_IP]{C.RESET}                            Пакетная активация новых камер из коробки и раздача IP
+  {C.GREEN}yeee resolve <CONFLICT_IP> <START_NEW_IP> [USER] [PASS] [GW]{C.RESET}   Разведение конфликтующих камер по MAC без отключения кабелей (+1 IP)
+  {C.GREEN}yeee set-ip <OLD_IP> <NEW_IP> [USER] [PASS] [GW] [--mac <MAC>]{C.RESET} Смена IP камеры (ISAPI/CGI/ONVIF) с авто-подбором заводских паролей
+
+{C.BOLD}ОТЧЕТЫ И ОЧИСТКА:{C.RESET}
+  {C.GREEN}yeee dump{C.RESET}                                                      Сохранить отчет аудита сразу в Markdown (.md) и PDF (.pdf)
+  {C.GREEN}yeee dump pdf{C.RESET} (или {C.GREEN}yeee pdf{C.RESET})                                   Сохранить инженерный отчет аудита в PDF (cameras_audit_<timestamp>.pdf)
+  {C.GREEN}yeee manual{C.RESET}                                                    Сгенерировать полную PDF-инструкцию инженера (YEEE_PRO_MANUAL_RU.pdf)
+  {C.GREEN}yeee clean{C.RESET}                                                     Удаление всех добавленных временных подсетей (label *:yeee)
+  {C.GREEN}yeee --help{C.RESET}                                                    Показать эту справку
+"""
+    print(help_text)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        return run_discovery(fast_mode=False)
+
+    cmd = args[0].lower()
+    if cmd in ("-h", "--help", "help"):
+        print_help()
+        return 0
+    elif cmd == "gui":
+        print(f"{C.CYAN}{C.BOLD}[PROCAM RADAR GUI]{C.RESET} Запуск графического приложения ProCam Radar...")
+        ok = run_gui_as_sudo_user(["/usr/local/bin/yeee-gui"])
+        return 0 if ok else 1
+    elif cmd in ("scan", "fast"):
+        return run_radar_scan()
+    elif cmd == "clean":
+        return clean_yeee_subnets()
+    elif cmd == "conflict":
+        return run_conflict_scan()
+    elif cmd == "pdf":
+        return run_dump_report(fmt="pdf")
+    elif cmd in ("manual", "man", "doc"):
+        return run_manual_command()
+    elif cmd == "dump":
+        if len(args) >= 2 and args[1].lower() in ("pdf", "md"):
+            return run_dump_report(fmt=args[1].lower())
+        return run_dump_report(fmt="both")
+    elif cmd == "info":
+        if len(args) < 2:
+            print(f"{C.RED}[ОШИБКА] Укажите IP-адрес: yeee info <IP>{C.RESET}")
+            return 1
+        return run_info_camera(args[1])
+    elif cmd == "free":
+        cnt = int(args[1]) if (len(args) >= 2 and args[1].isdigit()) else 10
+        sub_arg = args[2] if len(args) >= 3 else None
+        return run_free_ips(cnt, sub_arg)
+    elif cmd == "play":
+        if len(args) < 2:
+            print(f"{C.RED}[ОШИБКА] Синтаксис: yeee play <IP> [USER] [PASS] [--sub]{C.RESET}")
+            return 1
+        sub_s = "--sub" in args
+        clean_a = [a for a in args[1:] if a != "--sub"]
+        u_a = clean_a[1] if len(clean_a) >= 3 else None
+        p_a = clean_a[2] if len(clean_a) >= 3 else None
+        return run_play_camera(clean_a[0], u_a, p_a, sub_stream=sub_s)
+    elif cmd == "snap":
+        if len(args) < 2:
+            print(f"{C.RED}[ОШИБКА] Синтаксис: yeee snap <IP> [USER] [PASS]{C.RESET}")
+            return 1
+        u_a = args[2] if len(args) >= 4 else None
+        p_a = args[3] if len(args) >= 4 else None
+        return run_snap_camera(args[1], u_a, p_a)
+    elif cmd == "activate":
+        if len(args) < 2:
+            print(f"{C.RED}[ОШИБКА] Синтаксис: yeee activate <NEW_PASS> [START_IP]{C.RESET}")
+            return 1
+        s_ip = args[2] if len(args) >= 3 else None
+        return run_activate_cameras(args[1], s_ip)
+    elif cmd == "watch":
+        return run_watch_mode()
+    elif cmd == "open":
+        if len(args) < 2:
+            print(f"{C.RED}[ОШИБКА] Укажите IP-адрес камеры: yeee open <IP> [--mac <MAC>]{C.RESET}")
+            return 1
+        target_mac = None
+        if len(args) >= 4 and args[2] == "--mac":
+            target_mac = args[3]
+        elif len(args) >= 3 and not args[2].startswith("-"):
+            target_mac = args[2]
+        return run_open_camera(args[1], target_mac=target_mac)
+    elif cmd == "cable":
+        if len(args) < 2:
+            print(f"{C.RED}[ОШИБКА] Укажите IP-адрес для проверки кабеля: yeee cable <IP>{C.RESET}")
+            return 1
+        return run_cable_diag(args[1])
+    elif cmd == "resolve":
+        if len(args) < 3:
+            print(f"{C.RED}[ОШИБКА] Синтаксис: yeee resolve <CONFLICT_IP> <START_NEW_IP> [USER] [PASS] [GATEWAY]{C.RESET}")
+            return 1
+        u_arg = args[3] if len(args) >= 5 else None
+        p_arg = args[4] if len(args) >= 5 else None
+        gw = args[5] if len(args) >= 6 else None
+        return run_resolve_conflicts(args[1], args[2], u_arg, p_arg, gw)
+    elif cmd == "set-ip":
+        raw_sub = args[1:]
+        target_mac = None
+        filtered = []
+        i = 0
+        while i < len(raw_sub):
+            if raw_sub[i] == "--mac" and i + 1 < len(raw_sub):
+                target_mac = raw_sub[i + 1]
+                i += 2
+            elif raw_sub[i].startswith("--mac="):
+                target_mac = raw_sub[i].split("=", 1)[1]
+                i += 1
+            else:
+                filtered.append(raw_sub[i])
+                i += 1
+        if len(filtered) < 2:
+            print(f"{C.RED}[ОШИБКА] Синтаксис: yeee set-ip <OLD_IP> <NEW_IP> [USER] [PASS] [GATEWAY] [--mac <TARGET_MAC>]{C.RESET}")
+            return 1
+        u_arg = filtered[2] if len(filtered) >= 4 else None
+        p_arg = filtered[3] if len(filtered) >= 4 else None
+        gw = filtered[4] if len(filtered) >= 5 else None
+        return run_set_ip(filtered[0], filtered[1], u_arg, p_arg, gw, target_mac=target_mac)
+    else:
+        print(f"{C.RED}[ОШИБКА] Неизвестная команда: {args[0]}{C.RESET}\n")
+        print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

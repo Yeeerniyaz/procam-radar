@@ -1,0 +1,34 @@
+{
+  "name": "ProCam Radar",
+  "version": "4.0.0",
+  "tag": "v4.0.0",
+  "released_at": "2026-10-30",
+  "repo_url": "https://github.com/Yeeerniyaz/procam-radar",
+  "windows": {
+    "filename": "ProCamRadar_Windows_x64.exe",
+    "size": "7.7 MB",
+    "arch": "Windows 10 / 11 (x64)",
+    "url": "https://github.com/Yeeerniyaz/procam-radar/releases/latest/download/ProCamRadar_Windows_x64.exe",
+    "fallback_url": "/downloads/ProCamRadar_Windows_x64.exe"
+  },
+  "linux": {
+    "filename": "ProCamRadar_Linux_x64",
+    "size": "7.5 MB",
+    "arch": "Linux Desktop (x64)",
+    "url": "https://github.com/Yeeerniyaz/procam-radar/releases/latest/download/ProCamRadar_Linux_x64",
+    "fallback_url": "/downloads/ProCamRadar_Linux_x64",
+    "install_cmd": "curl -fsSL https://raw.githubusercontent.com/Yeeerniyaz/procam-radar/main/dist/linux/install.sh | sudo bash"
+  },
+  "manual": {
+    "filename": "PROCAM_RADAR_MANUAL_RU.pdf",
+    "size": "80 KB",
+    "url": "https://raw.githubusercontent.com/Yeeerniyaz/procam-radar/main/PROCAM_RADAR_MANUAL_RU.pdf",
+    "fallback_url": "/downloads/PROCAM_RADAR_MANUAL_RU.pdf"
+  },
+  "changelog": [
+    "Одновременная работа Кабеля (Ethernet/PoE) и Wi-Fi роутера без потери интернета (/32 маршрутизация)",
+    "Подбор свободных IP-адресов с точным выбором количества камер (1, 4, 8, 16, 32, 64 или 1..245)",
+    "Прямое открытие камеры по MAC-адресу при конфликте IP (192.168.1.64) без отключения кабелей",
+    "Беспарольный паспорт камеры (статус активации, часы ONVIF, порты) и тест кабеля RJ-45 (MTU 1500)"
+  ]
+}
