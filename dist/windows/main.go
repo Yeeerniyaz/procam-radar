@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-const Version = "4.0.0"
+const Version = "4.1.0"
 const AppName = "ProCam Radar"
 
 var cameraOUI = map[string]string{
@@ -72,6 +72,8 @@ type CameraEntry struct {
 	Model       string `json:"model"`
 	Serial      string `json:"serial"`
 	Firmware    string `json:"firmware"`
+	DeviceType  string `json:"device_type"`  // "nvr" or "camera"
+	DeviceLabel string `json:"device_label"` // "NVR / Регистратор" or "IP-Камера"
 	Ports       []int  `json:"ports"`
 	Zone        string `json:"zone"`
 	ZoneType    string `json:"zone_type"`
@@ -442,8 +444,12 @@ func parseDiscoveryPayload(raw []byte) (ip, mac, vendor, model, serial, fw strin
 		if m := reOnvifIP.FindStringSubmatch(txt); len(m) > 1 && ip == "" {
 			ip = m[1]
 		}
+		upTxt := strings.ToUpper(txt)
+		if model == "" && (strings.Contains(upTxt, "NETWORKVIDEOSTORAGE") || strings.Contains(upTxt, "NVR") || strings.Contains(upTxt, "DVR") || strings.Contains(upTxt, "XVR") || strings.Contains(upTxt, "RECORDER")) {
+			model = "ONVIF NVR"
+		}
 		if vendor == "" {
-			vendor = "ONVIF Camera"
+			vendor = "ONVIF Device"
 		}
 	}
 	if strings.Contains(txt, "DHDiscover") || strings.Contains(txt, `"DeviceType"`) {
@@ -508,7 +514,7 @@ func readSystemARPTable() map[string][]ARPRecord {
 }
 
 func scanPorts(ip string) []int {
-	targetPorts := []int{80, 443, 554, 8000, 37777}
+	targetPorts := []int{80, 443, 554, 8000, 37777, 34567}
 	var open []int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -528,6 +534,93 @@ func scanPorts(ip string) []int {
 	wg.Wait()
 	sort.Ints(open)
 	return open
+}
+
+// Определение типа устройства: NVR / DVR / XVR (Видеорегистратор) или IP-Камера
+func classifyDeviceRole(ip, vendor, model string, ports []int) (devType, devLabel, enrichedModel string) {
+	enrichedModel = model
+	upModel := strings.ToUpper(model)
+	upVendor := strings.ToUpper(vendor)
+
+	nvrKeywords := []string{
+		"NVR", "DVR", "XVR", "HCVR", "CVR", "EVR",
+		"DS-71", "DS-72", "DS-73", "DS-76", "DS-77", "DS-86", "DS-96", "DS-E0",
+		"IDS-71", "IDS-72", "IDS-76", "IDS-77", "IDS-96",
+		"DS-N2", "DS-N3", "DS-H1", "DS-H2", "MH-",
+		"DHI-NVR", "DHI-XVR", "DHI-HCVR",
+		"NVR1", "NVR2", "NVR4", "NVR5", "NVR6",
+		"XVR1", "XVR4", "XVR5", "XVR7",
+		"NVR30", "NVR50", "XVR30", "NETWORKVIDEOSTORAGE", "RECORDER",
+	}
+	for _, kw := range nvrKeywords {
+		if strings.Contains(upModel, kw) || strings.Contains(upVendor, kw) {
+			return "nvr", "NVR / Регистратор", enrichedModel
+		}
+	}
+
+	// Быстрый HTTP-опрос заголовка Server и XML-паспорта (DNVRS-Webs = Hikvision NVR/DVR)
+	hasHTTP := false
+	has34567 := false
+	for _, p := range ports {
+		if p == 80 || p == 443 {
+			hasHTTP = true
+		}
+		if p == 34567 {
+			has34567 = true
+		}
+	}
+
+	if hasHTTP {
+		client := &http.Client{
+			Timeout: 350 * time.Millisecond,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		for _, path := range []string{"/ISAPI/System/deviceInfo", "/doc/page/login.asp", "/"} {
+			resp, err := client.Get(fmt.Sprintf("http://%s%s", ip, path))
+			if err != nil {
+				continue
+			}
+			srv := strings.ToUpper(resp.Header.Get("Server"))
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			bodyStr := string(bodyBytes)
+			upBody := strings.ToUpper(bodyStr)
+
+			if enrichedModel == "" {
+				reMod := regexp.MustCompile(`(?i)<model>([^<]+)</model>`)
+				if m := reMod.FindStringSubmatch(bodyStr); len(m) > 1 {
+					enrichedModel = strings.TrimSpace(m[1])
+					upModel = strings.ToUpper(enrichedModel)
+				}
+			}
+
+			// Hikvision / HiWatch NVR всегда отдает заголовок Server: DNVRS-Webs
+			if strings.Contains(srv, "DNVRS-WEBS") || strings.Contains(srv, "NVR") || strings.Contains(srv, "DVR") {
+				return "nvr", "NVR / Регистратор", enrichedModel
+			}
+			if strings.Contains(upBody, "<DEVICETYPE>NVR") ||
+				strings.Contains(upBody, "<DEVICETYPE>DVR") ||
+				strings.Contains(upBody, "<DEVICETYPE>HYBRID") ||
+				strings.Contains(upBody, "NETWORK VIDEO RECORDER") ||
+				strings.Contains(upBody, "DIGITAL VIDEO RECORDER") {
+				return "nvr", "NVR / Регистратор", enrichedModel
+			}
+			for _, kw := range nvrKeywords {
+				if strings.Contains(upModel, kw) {
+					return "nvr", "NVR / Регистратор", enrichedModel
+				}
+			}
+			break
+		}
+	}
+
+	if has34567 && (strings.Contains(upVendor, "XIONGMAI") || strings.Contains(upModel, "DVR") || strings.Contains(upModel, "NVR")) {
+		return "nvr", "NVR / Регистратор", enrichedModel
+	}
+
+	return "camera", "IP-Камера", enrichedModel
 }
 
 // Двухуровневое сканирование сразу по всем выбранным интерфейсам (Проводной кабель + Wi-Fi)
@@ -619,7 +712,8 @@ func runFullRadarScan(ifaceFilter string) []CameraEntry {
 		defer conn.Close()
 		_ = conn.SetReadDeadline(time.Now().Add(2200 * time.Millisecond))
 
-		onvifXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header><w:MessageID>uuid:%s</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04/discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>`, randomUUID())
+		onvifXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2003/05/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header><w:MessageID>uuid:%s</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04/discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>`, randomUUID())
+		onvifNvrXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header><w:MessageID>uuid:%s</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04/discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoStorage</d:Types></d:Probe></e:Body></e:Envelope>`, randomUUID())
 		sadpXML := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><Probe><Uuid>%s</Uuid><Types>inquiry</Types></Probe>`, strings.ToUpper(randomUUID()))
 		dahuaJSON := `{"method":"DHDiscover.search","params":{"mac":"","uni":1}}`
 
@@ -629,6 +723,8 @@ func runFullRadarScan(ifaceFilter string) []CameraEntry {
 		}{
 			{"239.255.255.250:3702", []byte(onvifXML)},
 			{"255.255.255.255:3702", []byte(onvifXML)},
+			{"239.255.255.250:3702", []byte(onvifNvrXML)},
+			{"255.255.255.255:3702", []byte(onvifNvrXML)},
 			{"239.255.255.250:37020", []byte(sadpXML)},
 			{"255.255.255.255:37020", []byte(sadpXML)},
 			{"239.255.255.251:37810", []byte(dahuaJSON)},
@@ -721,7 +817,7 @@ func runFullRadarScan(ifaceFilter string) []CameraEntry {
 			ports := scanPorts(ip)
 			hasCamPort := false
 			for _, p := range ports {
-				if p == 554 || p == 8000 || p == 37777 {
+				if p == 554 || p == 8000 || p == 37777 || p == 34567 {
 					hasCamPort = true
 				}
 			}
@@ -777,6 +873,7 @@ func runFullRadarScan(ifaceFilter string) []CameraEntry {
 		if len(entry.Ports) == 0 {
 			entry.Ports = scanPorts(entry.IP)
 		}
+		entry.DeviceType, entry.DeviceLabel, entry.Model = classifyDeviceRole(entry.IP, entry.Vendor, entry.Model, entry.Ports)
 
 		isLocal := false
 		parsedIP := net.ParseIP(entry.IP)
@@ -1922,7 +2019,7 @@ const uiHTML = `<!DOCTYPE html>
           <path d="M32 37L28.5 44L32 50L35.5 44L32 37Z" fill="#E4E4E7"/>
         </svg>
         <div>
-          <div class="wordmark-main">PRO<span class="cam">CAM</span><span class="radar-pill">RADAR v4.0</span></div>
+          <div class="wordmark-main">PRO<span class="cam">CAM</span><span class="radar-pill">RADAR v4.1</span></div>
           <div class="wordmark-sub">СИСТЕМЫ ВИДЕОНАБЛЮДЕНИЯ · ИНЖЕНЕРНЫЙ КОМПЛЕКС</div>
         </div>
       </div>
@@ -1939,6 +2036,7 @@ const uiHTML = `<!DOCTYPE html>
     </div>
 
     <div class="header-actions">
+      <button class="btn btn-outline-emerald" onclick="openCalcModal()">Калькулятор (HDD · PoE · Объектив)</button>
       <button class="btn" onclick="cleanSubnets()">Очистить временные сети</button>
       <button class="btn" onclick="downloadAuditPDF()">Скачать PDF-отчет</button>
       <a class="btn" href="https://wa.me/77066066323?text=%D0%97%D0%B4%D1%80%D0%B0%D0%B2%D1%81%D1%82%D0%B2%D1%83%D0%B9%D1%82%D0%B5%2C%20ProCam!%20%D0%9F%D0%B8%D1%88%D1%83%20%D0%B8%D0%B7%20%D0%BF%D1%80%D0%BE%D0%B3%D1%80%D0%B0%D0%BC%D0%BC%D1%8B%20ProCam%20Radar%2C%20%D0%BD%D1%83%D0%B6%D0%BD%D0%B0%20%D0%BF%D0%BE%D0%BC%D0%BE%D1%89%D1%8C%20%D0%B8%D0%BD%D0%B6%D0%B5%D0%BD%D0%B5%D1%80%D0%B0%20%2F%20%D1%80%D0%B0%D1%81%D1%87%D1%91%D1%82%20%D0%BE%D0%B1%D0%BE%D1%80%D1%83%D0%B4%D0%BE%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F." target="_blank" style="text-decoration:none; border-color:#10B981; color:#059669;">Помощь инженера / Заказ камер</a>
@@ -1953,7 +2051,7 @@ const uiHTML = `<!DOCTYPE html>
       <div class="toolbar-left">
         <button class="btn btn-dark" id="scanBtn" style="padding:10px 20px; font-size:13.5px;" onclick="runScan()">
           <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10B981;"></span>
-          Найти камеры в сети
+          Найти камеры и NVR
         </button>
         <button class="btn" id="plugBtn" style="padding:10px 18px; font-size:13px; border-color:var(--dark);" onclick="runPlugScan()">
           Поиск по кабелю (Отключи → Включи)
@@ -1961,12 +2059,17 @@ const uiHTML = `<!DOCTYPE html>
         <button class="btn" style="padding:10px 16px;" onclick="toggleFreePanel()">
           Подбор свободных IP
         </button>
+        <button class="btn" style="padding:10px 16px;" onclick="openCalcModal()">
+          Калькулятор HDD / PoE
+        </button>
         <button class="btn" style="padding:10px 16px;" onclick="openActivateModal()">
           Пакетная активация и разведение
         </button>
 
         <div class="tabs">
           <button class="tab active" id="tab-all" onclick="setFilter('all')">Все (<span id="cnt-all">0</span>)</button>
+          <button class="tab" id="tab-camera" onclick="setFilter('camera')">Камеры (<span id="cnt-camera">0</span>)</button>
+          <button class="tab" id="tab-nvr" onclick="setFilter('nvr')">NVR / Регистраторы (<span id="cnt-nvr">0</span>)</button>
           <button class="tab" id="tab-local" onclick="setFilter('local')">Своя сеть (<span id="cnt-local">0</span>)</button>
           <button class="tab" id="tab-foreign" onclick="setFilter('foreign')">Чужая подсеть (<span id="cnt-foreign">0</span>)</button>
           <button class="tab" id="tab-conflict" onclick="setFilter('conflict')">Конфликты IP (<span id="cnt-conflict">0</span>)</button>
@@ -2189,8 +2292,164 @@ const uiHTML = `<!DOCTYPE html>
         Если несколько камер сидят на одном IP (например, 192.168.1.64), выберите камеру в таблице и нажмите <b>«Открыть по MAC (при конфликте)»</b>. Вторая камера блокируется на уровне сетевой карты, и в браузере открывается именно выбранная камера.
       </div>
       <div class="help-item">
-        <b>5. Паспорт камеры и Проверка кабеля и PoE</b>
-        Кнопка <b>«Паспорт камеры»</b> без пароля показывает статус активации и точность часов ONVIF. Кнопка <b>«Проверка кабеля и PoE»</b> тестирует линию пакетами 64B и 1472B (MTU 1500), выявляя плохой обжим RJ-45 и просадку питания.
+        <b>5. Паспорт камеры, Проверка кабеля и Инженерный калькулятор (HDD · PoE · Объектив)</b>
+        Кнопка <b>«Паспорт камеры»</b> без пароля показывает статус активации и точность часов ONVIF. Кнопка <b>«Проверка кабеля и PoE»</b> тестирует линию пакетами 64B и 1472B (MTU 1500). Кнопка <b>«Калькулятор (HDD · PoE · Объектив)»</b> рассчитывает объем жесткого диска, мощность PoE-коммутатора, входящий поток NVR и угол обзора объектива (2.8 / 4 / 6 / 12 мм).
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Инженерный калькулятор (HDD + PoE + Объектив) -->
+  <div class="modal-backdrop" id="calcModal" onclick="if(event.target===this)closeCalcModal()">
+    <div class="modal-box" style="max-width:860px;">
+      <div class="modal-top">
+        <div>
+          <div class="eyebrow" style="color:var(--emerald-dark);">// ИНЖЕНЕРНЫЙ КАЛЬКУЛЯТОР ВИДЕОНАБЛЮДЕНИЯ PROCAM</div>
+          <div class="modal-title" style="margin-top:2px;">Расчет жесткого диска (HDD), трафика PoE/NVR и объектива камер</div>
+        </div>
+        <button class="btn" onclick="closeCalcModal()">Закрыть</button>
+      </div>
+
+      <!-- Вкладки калькулятора -->
+      <div class="tabs" style="margin-bottom:16px; width:100%; justify-content:space-between;">
+        <button class="tab active" id="ctab-hdd" style="flex:1; padding:9px 14px;" onclick="setCalcTab('hdd')">1. Жесткий диск и Архив (HDD)</button>
+        <button class="tab" id="ctab-poe" style="flex:1; padding:9px 14px;" onclick="setCalcTab('poe')">2. Сеть, NVR и Бюджет PoE</button>
+        <button class="tab" id="ctab-lens" style="flex:1; padding:9px 14px;" onclick="setCalcTab('lens')">3. Объектив (2.8–12 мм) и DORI</button>
+      </div>
+
+      <!-- Вкладка 1: HDD & Архив -->
+      <div id="cpanel-hdd">
+        <div class="share-box" style="display:flex; flex-direction:column; gap:12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+            <div>
+              <div style="font-size:12px; font-weight:700; color:var(--dark); margin-bottom:4px;">Количество камер в системе:</div>
+              <div class="count-pills">
+                <button class="count-pill" onclick="setCalcCams(1)">1</button>
+                <button class="count-pill" onclick="setCalcCams(4)">4</button>
+                <button class="count-pill active" onclick="setCalcCams(8)">8</button>
+                <button class="count-pill" onclick="setCalcCams(16)">16</button>
+                <button class="count-pill" onclick="setCalcCams(32)">32</button>
+                <button class="count-pill" onclick="setCalcCams(64)">64</button>
+              </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <input type="number" id="calcCams" value="8" min="1" max="512" class="mono" style="width:82px; font-weight:800;" oninput="calcUpdate()">
+              <button class="btn" style="padding:7px 12px; font-size:11.5px;" onclick="useScannedCamsInCalc()">Взять из найденных в сети</button>
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;">
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Разрешение камер:</div>
+              <select id="calcRes" style="width:100%;" onchange="calcUpdate()">
+                <option value="2">2 МП (1080p Full HD)</option>
+                <option value="4" selected>4 МП (2K QHD — Стандарт)</option>
+                <option value="5">5 МП (Super HD)</option>
+                <option value="6">6 МП (Ultra HD)</option>
+                <option value="8">8 МП (4K Ultra HD)</option>
+              </select>
+            </div>
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Кодек сжатия:</div>
+              <select id="calcCodec" style="width:100%;" onchange="calcUpdate()">
+                <option value="h265plus" selected>H.265+ / Smart H.265+ (Экономия 65%)</option>
+                <option value="h265">H.265 (Стандартный HEVC)</option>
+                <option value="h264">H.264 (Старый кодек)</option>
+              </select>
+            </div>
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Частота кадров (FPS):</div>
+              <select id="calcFPS" style="width:100%;" onchange="calcUpdate()">
+                <option value="15">15 к/с (Эконом)</option>
+                <option value="20" selected>20 к/с (Оптимально)</option>
+                <option value="25">25 к/с (Плавное видео)</option>
+              </select>
+            </div>
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Режим записи:</div>
+              <select id="calcMode" style="width:100%;" onchange="calcUpdate()">
+                <option value="1.0" selected>Постоянная запись 24/7 (100%)</option>
+                <option value="0.7">По движению: Магазин / Склад (~70%)</option>
+                <option value="0.45">По движению: Дом / Офис (~45%)</option>
+              </select>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+            <div>
+              <div style="font-size:12px; font-weight:700; color:var(--dark); margin-bottom:4px;">Глубина хранения архива (дней):</div>
+              <div class="count-pills">
+                <button class="count-pill" onclick="setCalcDays(7)">7 дней</button>
+                <button class="count-pill" onclick="setCalcDays(14)">14 дней</button>
+                <button class="count-pill active" onclick="setCalcDays(30)">30 дней (1 мес)</button>
+                <button class="count-pill" onclick="setCalcDays(60)">60 дней</button>
+                <button class="count-pill" onclick="setCalcDays(90)">90 дней</button>
+              </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <span style="font-size:12px; color:var(--muted); font-weight:600;">Дней:</span>
+              <input type="number" id="calcDays" value="30" min="1" max="365" class="mono" style="width:76px; font-weight:800;" oninput="calcUpdate()">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Вкладка 2: PoE, коммутатор и трафик NVR -->
+      <div id="cpanel-poe" style="display:none;">
+        <div class="share-box" style="display:flex; flex-direction:column; gap:12px;">
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px;">
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Тип подсветки и питания камер:</div>
+              <select id="calcCamPower" style="width:100%;" onchange="calcUpdate()">
+                <option value="6.5" selected>Обычные ИК-камеры (802.3af — до 6.5 Вт)</option>
+                <option value="10.5">ColorVu / Dual-Light LED (до 10.5 Вт)</option>
+                <option value="22.0">Поворотные PTZ-купола (802.3at PoE+ — до 22 Вт)</option>
+              </select>
+            </div>
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Максимальная длина кабеля UTP (м):</div>
+              <input type="number" id="calcCableLen" value="65" min="5" max="300" class="mono" style="width:100%; font-weight:800;" oninput="calcUpdate()">
+            </div>
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Материал витой пары UTP Cat5e:</div>
+              <select id="calcCableMat" style="width:100%;" onchange="calcUpdate()">
+                <option value="cu" selected>Чистая медь (100% Cu, 0.51 мм — ГОСТ)</option>
+                <option value="cca">Омедненный алюминий (CCA — бюджетный)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Вкладка 3: Объектив (2.8 / 4 / 6 / 12 мм) и DORI -->
+      <div id="cpanel-lens" style="display:none;">
+        <div class="share-box" style="display:flex; flex-direction:column; gap:12px;">
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px;">
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Фокусное расстояние объектива:</div>
+              <select id="calcFocal" style="width:100%;" onchange="calcUpdate()">
+                <option value="2.8" selected>2.8 мм — Широкий угол ~103° (Двор / Помещение)</option>
+                <option value="4.0">4.0 мм — Средний угол ~83° (Вход / Калитка / Коридор)</option>
+                <option value="6.0">6.0 мм — Направленный ~54° (Парковка / Периметр)</option>
+                <option value="12.0">12.0 мм — Дальнобойный ~25° (Шлагбаум / Ворота)</option>
+              </select>
+            </div>
+            <div>
+              <div style="font-size:11.5px; font-weight:700; color:var(--muted); margin-bottom:4px;">Расстояние до объекта (метров):</div>
+              <input type="number" id="calcDist" value="10" min="1" max="150" class="mono" style="width:100%; font-weight:800;" oninput="calcUpdate()">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Сводное табло результатов (всегда видно) -->
+      <div class="dark-panel" style="padding:18px 22px; margin-top:4px;">
+        <div class="eyebrow" style="margin-bottom:10px;">// ИТОГОВЫЙ ИНЖЕНЕРНЫЙ РАСЧЕТ СИСТЕМЫ</div>
+        <div id="calcSummaryGrid" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(175px, 1fr)); gap:12px; margin-bottom:14px;"></div>
+        <div id="calcDetailsBox" style="background:#18181B; border:1px solid #27272A; border-radius:12px; padding:12px 14px; font-size:12.5px; color:#E4E4E7; line-height:1.6;"></div>
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-top:14px; padding-top:12px; border-top:1px solid #27272A;">
+          <button class="btn-wb" onclick="copyCalcSummary()">Скопировать расчет для клиента</button>
+          <a class="btn-wb btn-wb-primary" id="calcWhatsappBtn" href="https://wa.me/77066066323" target="_blank" style="text-decoration:none;">Заказать комплект по расчету в WhatsApp</a>
+        </div>
       </div>
     </div>
   </div>
@@ -2200,11 +2459,169 @@ let allCameras = [];
 let currentFilter = 'all';
 let selectedIP = '';
 let selectedMAC = '';
+let lastCalcPlainText = '';
 
 function openHelpModal() { document.getElementById('helpModal').style.display = 'flex'; }
 function closeHelpModal() { document.getElementById('helpModal').style.display = 'none'; }
 function openActivateModal() { document.getElementById('activateModal').style.display = 'flex'; }
 function closeActivateModal() { document.getElementById('activateModal').style.display = 'none'; }
+function openCalcModal() {
+  document.getElementById('calcModal').style.display = 'flex';
+  calcUpdate();
+}
+function closeCalcModal() { document.getElementById('calcModal').style.display = 'none'; }
+
+function setCalcTab(tab) {
+  ['hdd', 'poe', 'lens'].forEach(k => {
+    document.getElementById('ctab-' + k).classList.toggle('active', k === tab);
+    document.getElementById('cpanel-' + k).style.display = (k === tab) ? 'block' : 'none';
+  });
+  calcUpdate();
+}
+
+function setCalcCams(n) {
+  document.getElementById('calcCams').value = n;
+  calcUpdate();
+}
+
+function setCalcDays(d) {
+  document.getElementById('calcDays').value = d;
+  calcUpdate();
+}
+
+function useScannedCamsInCalc() {
+  const camOnly = allCameras.filter(c => c.device_type !== 'nvr').length;
+  const n = camOnly > 0 ? camOnly : (allCameras.length || 8);
+  document.getElementById('calcCams').value = n;
+  calcUpdate();
+}
+
+function calcUpdate() {
+  const cams = Math.max(1, parseInt(document.getElementById('calcCams').value || '8', 10));
+  const resMP = parseFloat(document.getElementById('calcRes').value || '4');
+  const codec = document.getElementById('calcCodec').value || 'h265plus';
+  const fps = parseInt(document.getElementById('calcFPS').value || '20', 10);
+  const modeFactor = parseFloat(document.getElementById('calcMode').value || '1.0');
+  const days = Math.max(1, parseInt(document.getElementById('calcDays').value || '30', 10));
+
+  // Базовый битрейт (Мбит/с) для 25 к/с на H.265
+  const baseMbpsMap = { 2: 2.2, 4: 3.8, 5: 4.5, 6: 5.2, 8: 7.5 };
+  let mbpsPerCam = baseMbpsMap[resMP] || 3.8;
+  if (codec === 'h265plus') mbpsPerCam *= 0.52;
+  else if (codec === 'h264') mbpsPerCam *= 1.85;
+  mbpsPerCam *= (fps / 25.0);
+  mbpsPerCam = Math.round(mbpsPerCam * 100) / 100;
+
+  const totalMbps = Math.round(mbpsPerCam * cams * 10) / 10;
+  const gbPerCamDay = (mbpsPerCam * 3600 * 24) / 8 / 1024 * modeFactor;
+  const totalGBPerDay = gbPerCamDay * cams;
+  const rawTotalTB = (totalGBPerDay * days) / 1024;
+  // С учетом реальной форматированной емкости HDD (~90.9%)
+  const diskNominalTB = rawTotalTB / 0.909;
+
+  let recDiskText = '1× 1 ТБ';
+  const stdSizes = [1, 2, 4, 6, 8, 10, 12, 16, 18, 20];
+  let foundSingle = stdSizes.find(s => s >= diskNominalTB);
+  if (foundSingle) {
+    recDiskText = '1× ' + foundSingle + ' ТБ (WD Purple / SkyHawk)';
+  } else {
+    const bays = Math.ceil(diskNominalTB / 10);
+    const perBay = stdSizes.find(s => s * bays >= diskNominalTB) || 10;
+    recDiskText = bays + '× ' + perBay + ' ТБ (суммарно ' + (bays * perBay) + ' ТБ)';
+  }
+
+  // PoE и NVR
+  const camWatts = parseFloat(document.getElementById('calcCamPower').value || '6.5');
+  const cableLen = Math.max(1, parseInt(document.getElementById('calcCableLen').value || '65', 10));
+  const cableMat = document.getElementById('calcCableMat').value || 'cu';
+  const totalPoEWatts = Math.round(cams * camWatts);
+  const recSwitchWatts = Math.ceil((totalPoEWatts * 1.3) / 10) * 10;
+
+  let nvrChannels = 4;
+  if (cams > 32) nvrChannels = 64;
+  else if (cams > 16) nvrChannels = 32;
+  else if (cams > 8) nvrChannels = 16;
+  else if (cams > 4) nvrChannels = 8;
+  const recNvrBandwidth = Math.max(40, Math.ceil((totalMbps * 1.5) / 40) * 40);
+
+  // Расчет падения напряжения на витой паре (петля 2 жилы / пара)
+  const loopOhmPer100m = (cableMat === 'cu') ? 18.8 : 29.5;
+  const loopR = (loopOhmPer100m * cableLen) / 100.0;
+  const currentA = camWatts / 48.0;
+  const vDrop = Math.round(currentA * loopR * 10) / 10;
+  const vAtCam = Math.round((48.0 - vDrop) * 10) / 10;
+  let cableVerdict = 'Норма (Гигабит / 100 Мбит/с без потерь)';
+  if (cableLen > 100 && cableLen <= 250) {
+    cableVerdict = 'Длина > 100 м: включите режим PoE Extend (10 Мбит/с до 250 м)';
+  } else if (cableLen > 250 || vAtCam < 37.0) {
+    cableVerdict = 'ВНИМАНИЕ: Критическая длина/просадка! Нужен PoE-удлинитель или оптика';
+  } else if (cableMat === 'cca' && cableLen > 70) {
+    cableVerdict = 'Риск просадки PoE ночью на кабеле CCA > 70 м (рекомендуется медь Cu)';
+  }
+
+  // Объектив и DORI
+  const focal = parseFloat(document.getElementById('calcFocal').value || '2.8');
+  const dist = Math.max(1, parseFloat(document.getElementById('calcDist').value || '10'));
+  const fovMap = { 2.8: 103, 4.0: 83, 6.0: 54, 12.0: 25 };
+  const angleDeg = fovMap[focal] || 90;
+  const sceneWidthM = Math.round(2 * dist * Math.tan((angleDeg * Math.PI) / 360) * 10) / 10;
+  const horizPxMap = { 2: 1920, 4: 2560, 5: 2880, 6: 3200, 8: 3840 };
+  const hPx = horizPxMap[resMP] || 2560;
+  const ppm = Math.round(hPx / Math.max(0.5, sceneWidthM));
+
+  // DORI дистанции (Detection 25 ppm, Observation 62 ppm, Recognition 125 ppm, Identification 250 ppm)
+  const factorW = 2 * Math.tan((angleDeg * Math.PI) / 360);
+  const doriId = Math.round((hPx / 250 / factorW) * 10) / 10;
+  const doriRec = Math.round((hPx / 125 / factorW) * 10) / 10;
+  const doriObs = Math.round((hPx / 62 / factorW) * 10) / 10;
+  const doriDet = Math.round((hPx / 25 / factorW) * 10) / 10;
+
+  document.getElementById('calcSummaryGrid').innerHTML =
+    '<div style="background:#18181B;border:1px solid #27272A;border-radius:12px;padding:10px 12px;">' +
+      '<div style="font-size:11px;color:#A1A1AA;">Чистый архив (' + days + ' дн.)</div>' +
+      '<div class="mono" style="font-size:18px;font-weight:900;color:#10B981;margin-top:2px;">' + rawTotalTB.toFixed(2) + ' ТБ</div>' +
+      '<div style="font-size:11px;color:#E4E4E7;margin-top:2px;">' + Math.round(totalGBPerDay) + ' ГБ / сутки</div>' +
+    '</div>' +
+    '<div style="background:#18181B;border:1px solid #27272A;border-radius:12px;padding:10px 12px;">' +
+      '<div style="font-size:11px;color:#A1A1AA;">Рекомендуемый HDD</div>' +
+      '<div style="font-size:15px;font-weight:800;color:#FFFFFF;margin-top:4px;">' + recDiskText + '</div>' +
+      '<div style="font-size:11px;color:#A1A1AA;margin-top:2px;">С учетом реальной емкости</div>' +
+    '</div>' +
+    '<div style="background:#18181B;border:1px solid #27272A;border-radius:12px;padding:10px 12px;">' +
+      '<div style="font-size:11px;color:#A1A1AA;">Поток и Регистратор</div>' +
+      '<div class="mono" style="font-size:16px;font-weight:900;color:#FFFFFF;margin-top:2px;">' + totalMbps + ' Мбит/с</div>' +
+      '<div style="font-size:11px;color:#10B981;margin-top:2px;">NVR: ' + nvrChannels + '-кан. (от ' + recNvrBandwidth + ' Мбит/с)</div>' +
+    '</div>' +
+    '<div style="background:#18181B;border:1px solid #27272A;border-radius:12px;padding:10px 12px;">' +
+      '<div style="font-size:11px;color:#A1A1AA;">Бюджет PoE коммутатора</div>' +
+      '<div class="mono" style="font-size:16px;font-weight:900;color:#F59E0B;margin-top:2px;">' + totalPoEWatts + ' Вт (мин. БП ' + recSwitchWatts + ' Вт)</div>' +
+      '<div style="font-size:11px;color:#E4E4E7;margin-top:2px;">На камере (' + cableLen + 'м): ~' + vAtCam + ' В</div>' +
+    '</div>';
+
+  document.getElementById('calcDetailsBox').innerHTML =
+    '<b>• Детализация архива и трафика:</b> 1 камера (' + resMP + ' МП, ' + codec.toUpperCase() + ', ' + fps + ' к/с) = <b>' + mbpsPerCam + ' Мбит/с</b> (' + gbPerCamDay.toFixed(1) + ' ГБ/сутки). Все ' + cams + ' шт. = <b>' + Math.round(totalGBPerDay) + ' ГБ/сутки</b>.<br>' +
+    '<b>• Кабельная трасса (' + cableLen + ' м):</b> ' + cableVerdict + '.<br>' +
+    '<b>• Объектив ' + focal + ' мм (~' + angleDeg + '°) на дистанции ' + dist + ' м:</b> ширина обзора <b>' + sceneWidthM + ' м</b> (плотность <b>' + ppm + ' пикс/м</b>). Чтение лица/номера (DORI ID): до <b>' + doriId + ' м</b> · Узнавание знакомого: до <b>' + doriRec + ' м</b> · Обнаружение человека: до <b>' + doriDet + ' м</b>.';
+
+  lastCalcPlainText =
+    'Расчет системы видеонаблюдения ProCam Radar:\n' +
+    '• Камер: ' + cams + ' шт. (' + resMP + ' МП, ' + codec.toUpperCase() + ', ' + fps + ' к/с)\n' +
+    '• Архив на ' + days + ' дн.: ' + rawTotalTB.toFixed(2) + ' ТБ -> Рекомендуемый HDD: ' + recDiskText + '\n' +
+    '• Регистратор (NVR): ' + nvrChannels + '-канальный (входящий поток ' + totalMbps + ' Мбит/с, запас от ' + recNvrBandwidth + ' Мбит/с)\n' +
+    '• PoE-коммутатор: потребление ' + totalPoEWatts + ' Вт (рекомендуемый БП от ' + recSwitchWatts + ' Вт)\n' +
+    '• Объектив ' + focal + ' мм (' + angleDeg + '°): захват на ' + dist + ' м = ' + sceneWidthM + ' м в ширину (чтение лица до ' + doriId + ' м).';
+
+  const waUrl = 'https://wa.me/77066066323?text=' + encodeURIComponent('Здравствуйте, ProCam! Нужен комплект по расчету из ProCam Radar:\n' + lastCalcPlainText);
+  document.getElementById('calcWhatsappBtn').href = waUrl;
+}
+
+function copyCalcSummary() {
+  if (!lastCalcPlainText) calcUpdate();
+  navigator.clipboard.writeText(lastCalcPlainText).then(() => {
+    log("Инженерный расчет скопирован в буфер обмена.");
+    alert("Расчет скопирован в буфер обмена! Можете вставить его в WhatsApp или КП клиенту.");
+  });
+}
 
 function toggleFreePanel() {
   const p = document.getElementById('freePanel');
@@ -2250,8 +2667,9 @@ async function loadSysInfo() {
 
 function setFilter(f) {
   currentFilter = f;
-  ['all', 'local', 'foreign', 'conflict'].forEach(k => {
-    document.getElementById('tab-' + k).classList.toggle('active', k === f);
+  ['all', 'camera', 'nvr', 'local', 'foreign', 'conflict'].forEach(k => {
+    const el = document.getElementById('tab-' + k);
+    if (el) el.classList.toggle('active', k === f);
   });
   renderTable();
 }
@@ -2268,27 +2686,33 @@ function renderTable() {
   const q = (document.getElementById('searchBox').value || '').toLowerCase().trim();
   const tb = document.getElementById('camBody');
 
-  let localCnt = 0, foreignCnt = 0, conflictCnt = 0;
+  let localCnt = 0, foreignCnt = 0, conflictCnt = 0, camCnt = 0, nvrCnt = 0;
   allCameras.forEach(c => {
+    if (c.device_type === 'nvr') nvrCnt++;
+    else camCnt++;
     if (c.zone_type === 'conflict') conflictCnt++;
     else if (c.zone_type === 'foreign') foreignCnt++;
     else localCnt++;
   });
 
   document.getElementById('cnt-all').textContent = allCameras.length;
+  document.getElementById('cnt-camera').textContent = camCnt;
+  document.getElementById('cnt-nvr').textContent = nvrCnt;
   document.getElementById('cnt-local').textContent = localCnt;
   document.getElementById('cnt-foreign').textContent = foreignCnt;
   document.getElementById('cnt-conflict').textContent = conflictCnt;
 
   const filtered = allCameras.filter(c => {
-    if (currentFilter !== 'all' && c.zone_type !== currentFilter) return false;
+    if (currentFilter === 'camera' && c.device_type === 'nvr') return false;
+    if (currentFilter === 'nvr' && c.device_type !== 'nvr') return false;
+    if (['local', 'foreign', 'conflict'].includes(currentFilter) && c.zone_type !== currentFilter) return false;
     if (!q) return true;
-    const hay = [c.ip, c.mac, c.vendor, c.model, c.serial, c.iface, c.subnet_alias].join(' ').toLowerCase();
+    const hay = [c.ip, c.mac, c.vendor, c.model, c.serial, c.device_label, c.iface, c.subnet_alias].join(' ').toLowerCase();
     return hay.includes(q);
   });
 
   if (!filtered.length) {
-    tb.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 36px 16px; color: var(--muted);">Камеры по выбранному фильтру не найдены. Нажмите «Найти камеры в сети».</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 36px 16px; color: var(--muted);">Устройства по выбранному фильтру не найдены. Нажмите «Найти камеры и NVR».</td></tr>';
     return;
   }
 
@@ -2302,6 +2726,11 @@ function renderTable() {
     if (c.zone_type === 'conflict') { zoneCls = 'zone-conflict'; dotCls = 'dot-conflict'; }
     else if (c.zone_type === 'foreign') { zoneCls = 'zone-foreign'; dotCls = 'dot-foreign'; }
 
+    const isNVR = (c.device_type === 'nvr');
+    const roleBadge = isNVR
+      ? '<span style="display:inline-block;padding:2px 7px;border-radius:6px;font-size:10.5px;font-weight:800;font-family:var(--font-mono);background:#EEF2FF;color:#4338CA;border:1px solid #C7D2FE;margin-right:6px;">NVR / РЕГИСТРАТОР</span>'
+      : '<span style="display:inline-block;padding:2px 7px;border-radius:6px;font-size:10.5px;font-weight:800;font-family:var(--font-mono);background:#F0FDF4;color:#15803D;border:1px solid #BBF7D0;margin-right:6px;">IP-КАМЕРА</span>';
+
     const ifaceLabel = (c.iface_kind === 'wifi' ? 'Wi-Fi · ' : 'Кабель · ') + (c.iface || 'LAN');
     const portsText = (c.ports && c.ports.length) ? c.ports.join(', ') : 'L2';
     const modelSerial = [c.model || '-', c.serial || ''].filter(Boolean).join(' · ');
@@ -2311,7 +2740,7 @@ function renderTable() {
       '<td><span class="iface-tag">' + ifaceLabel + '</span></td>' +
       '<td class="mono" style="font-weight:800; color:var(--dark);">' + c.ip + '</td>' +
       '<td class="mono" style="color:var(--muted);">' + (c.mac || '-') + '</td>' +
-      '<td style="font-weight:600;">' + c.vendor + '</td>' +
+      '<td style="font-weight:600;">' + roleBadge + c.vendor + '</td>' +
       '<td style="color:var(--muted);">' + modelSerial + '</td>' +
       '<td class="mono" style="color:var(--muted);">' + portsText + '</td>' +
       '<td style="color:var(--muted); font-size:12px;">' + c.subnet_alias + '</td>' +
@@ -2338,12 +2767,14 @@ async function runScan() {
     } else {
       renderTable();
     }
-    log("Поиск завершен. Обнаружено IP-камер: " + allCameras.length);
+    const nvrCnt = allCameras.filter(c => c.device_type === 'nvr').length;
+    const camCnt = allCameras.length - nvrCnt;
+    log("Поиск завершен. Обнаружено устройств: " + allCameras.length + " (IP-камер: " + camCnt + ", NVR / Регистраторов: " + nvrCnt + ")");
   } catch (e) {
     log("Ошибка сканирования: " + e);
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10B981;"></span> Найти камеры в сети';
+    btn.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10B981;"></span> Найти камеры и NVR';
   }
 }
 
