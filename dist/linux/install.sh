@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ProCam Radar v4.0 — Автоматический установщик для Linux (Ubuntu / Debian / Arch)
-# Устанавливает программу, иконку Кибер-Совы и ярлык в меню приложений.
+# Устанавливает основное приложение ProCamRadar_Linux_x64, иконку Кибер-Совы
+# и ярлык в меню приложений.
 # ==============================================================================
 set -euo pipefail
 
@@ -19,13 +20,20 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-install -d /usr/local/bin /usr/share/pixmaps /usr/share/icons/hicolor/scalable/apps /usr/share/applications
+install -d /usr/local/bin \
+  /usr/share/pixmaps \
+  /usr/share/icons/hicolor/64x64/apps \
+  /usr/share/icons/hicolor/256x256/apps \
+  /usr/share/icons/hicolor/512x512/apps \
+  /usr/share/icons/hicolor/scalable/apps \
+  /usr/share/applications
+
+# Удаляем старые ярлыки от прежних версий
+rm -f /usr/share/applications/yeee-cam.desktop
 
 # 1. Ядро CLI (procam-radar)
 if [[ -f "${ROOT_DIR}/procam-radar" ]]; then
   install -m 0755 "${ROOT_DIR}/procam-radar" /usr/local/bin/procam-radar
-elif [[ -f "${ROOT_DIR}/yeee" ]]; then
-  install -m 0755 "${ROOT_DIR}/yeee" /usr/local/bin/procam-radar
 else
   echo "[1/4] Скачивание ядра procam-radar из GitHub..."
   curl -fsSL "${REPO_RAW}/procam-radar" -o /usr/local/bin/procam-radar
@@ -33,35 +41,43 @@ else
 fi
 ln -sf /usr/local/bin/procam-radar /usr/local/bin/yeee
 
-# 2. Нативное графическое приложение (procam-radar-gui) и студия (ProCamRadar_Linux_x64)
-if [[ -f "${SCRIPT_DIR}/procam-radar-gui" ]]; then
-  install -m 0755 "${SCRIPT_DIR}/procam-radar-gui" /usr/local/bin/procam-radar-gui
-else
-  echo "[2/4] Скачивание графического интерфейса procam-radar-gui..."
-  curl -fsSL "${REPO_RAW}/dist/linux/procam-radar-gui" -o /usr/local/bin/procam-radar-gui
-  chmod 0755 /usr/local/bin/procam-radar-gui
-fi
-ln -sf /usr/local/bin/procam-radar-gui /usr/local/bin/yeee-gui
-
+# 2. Главное графическое приложение (ProCamRadar_Linux_x64)
 if [[ -f "${SCRIPT_DIR}/ProCamRadar_Linux_x64" ]]; then
   install -m 0755 "${SCRIPT_DIR}/ProCamRadar_Linux_x64" /usr/local/bin/ProCamRadar_Linux_x64
+elif [[ -f "${ROOT_DIR}/dist/linux/ProCamRadar_Linux_x64" ]]; then
+  install -m 0755 "${ROOT_DIR}/dist/linux/ProCamRadar_Linux_x64" /usr/local/bin/ProCamRadar_Linux_x64
+else
+  echo "[2/4] Скачивание графического приложения ProCamRadar_Linux_x64..."
+  curl -fsSL "${REPO_REL}/ProCamRadar_Linux_x64" -o /usr/local/bin/ProCamRadar_Linux_x64
+  chmod 0755 /usr/local/bin/ProCamRadar_Linux_x64
 fi
+ln -sf /usr/local/bin/ProCamRadar_Linux_x64 /usr/local/bin/procam-radar-gui
+ln -sf /usr/local/bin/ProCamRadar_Linux_x64 /usr/local/bin/yeee-gui
 
-# 3. Фирменная иконка Кибер-Совы (PNG + SVG)
+# 3. Фирменная иконка Кибер-Совы (во все системные каталоги иконок)
 if [[ -f "${ROOT_DIR}/assets/procam-radar-256.png" ]]; then
   install -m 0644 "${ROOT_DIR}/assets/procam-radar-256.png" /usr/share/pixmaps/procam-radar.png
+  install -m 0644 "${ROOT_DIR}/assets/procam-radar-256.png" /usr/share/icons/hicolor/256x256/apps/procam-radar.png
 else
   echo "[3/4] Скачивание иконки procam-radar.png..."
   curl -fsSL "${REPO_RAW}/assets/procam-radar-256.png" -o /usr/share/pixmaps/procam-radar.png
+  cp -f /usr/share/pixmaps/procam-radar.png /usr/share/icons/hicolor/256x256/apps/procam-radar.png
 fi
 
+if [[ -f "${ROOT_DIR}/assets/procam-radar.png" ]]; then
+  install -m 0644 "${ROOT_DIR}/assets/procam-radar.png" /usr/share/icons/hicolor/512x512/apps/procam-radar.png
+fi
+if [[ -f "${ROOT_DIR}/assets/procam-radar-64.png" ]]; then
+  install -m 0644 "${ROOT_DIR}/assets/procam-radar-64.png" /usr/share/icons/hicolor/64x64/apps/procam-radar.png
+fi
 if [[ -f "${ROOT_DIR}/assets/procam-radar.svg" ]]; then
   install -m 0644 "${ROOT_DIR}/assets/procam-radar.svg" /usr/share/icons/hicolor/scalable/apps/procam-radar.svg
 else
   curl -fsSL "${REPO_RAW}/assets/procam-radar.svg" -o /usr/share/icons/hicolor/scalable/apps/procam-radar.svg || true
 fi
+gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 
-# 4. Ярлык в меню приложений (.desktop)
+# 4. Ярлык в меню приложений (.desktop) — запускает ProCamRadar_Linux_x64
 cat > /usr/share/applications/procam-radar.desktop << 'EOF'
 [Desktop Entry]
 Version=4.0
@@ -69,18 +85,40 @@ Type=Application
 Name=ProCam Radar
 GenericName=Поиск и диагностика IP-камер
 Comment=Инженерный графический комплекс поиска, диагностики и настройки IP-камер ProCam
-Exec=/usr/local/bin/procam-radar-gui
-Icon=procam-radar
+Exec=/usr/local/bin/ProCamRadar_Linux_x64
+Icon=/usr/share/pixmaps/procam-radar.png
 Terminal=false
 Categories=Network;Utility;Security;
-StartupWMClass=ProCam Radar
+StartupWMClass=ProCamRadar
 EOF
 chmod 0644 /usr/share/applications/procam-radar.desktop
+
+# 5. Обработчик двойного клика для бинарных файлов в GNOME Files (Nautilus)
+cat > /usr/local/bin/procam-run-binary << 'EOF'
+#!/usr/bin/env bash
+TARGET="$1"
+if [[ -f "$TARGET" ]]; then
+  chmod +x "$TARGET" 2>/dev/null || true
+  exec "$TARGET"
+fi
+EOF
+chmod 0755 /usr/local/bin/procam-run-binary
+
+cat > /usr/share/applications/procam-run-binary.desktop << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=Запуск приложения Linux (ProCam)
+Exec=/usr/local/bin/procam-run-binary %f
+Icon=/usr/share/pixmaps/procam-radar.png
+Terminal=false
+NoDisplay=true
+MimeType=application/x-executable;application/x-pie-executable;
+EOF
+chmod 0644 /usr/share/applications/procam-run-binary.desktop
 update-desktop-database /usr/share/applications 2>/dev/null || true
 
 echo "================================================================"
 echo "  ✔ ProCam Radar v4.0 успешно установлен!"
 echo "  • Запуск из меню приложений:  ProCam Radar (с иконкой совы)"
-echo "  • Запуск из терминала (GUI):  procam-radar-gui"
-echo "  • Запуск веб-студии:          ProCamRadar_Linux_x64"
+echo "  • Запуск из терминала:        ProCamRadar_Linux_x64"
 echo "================================================================"

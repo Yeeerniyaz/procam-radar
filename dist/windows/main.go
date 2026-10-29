@@ -1215,12 +1215,27 @@ func cleanupAndExit() {
 	os.Exit(0)
 }
 
+const appIconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <rect width="100" height="100" rx="22" fill="#09090B"/>
+  <path d="M50 8 L88 26 L88 54 C88 76 50 92 50 92 C50 92 12 76 12 54 L12 26 Z" fill="#18181B" stroke="#F59E0B" stroke-width="4" stroke-linejoin="round"/>
+  <polygon points="50,15 32,33 50,27 68,33" fill="#0284C7" opacity="0.88"/>
+  <polygon points="18,22 36,33 23,46" fill="#F59E0B"/>
+  <polygon points="82,22 64,33 77,46" fill="#F59E0B"/>
+  <polygon points="21,45 45,45 48,60 25,60" fill="#09090B" stroke="#38BDF8" stroke-width="2.5"/>
+  <polygon points="79,45 55,45 52,60 75,60" fill="#09090B" stroke="#38BDF8" stroke-width="2.5"/>
+  <circle cx="35" cy="52.5" r="5" fill="#F59E0B"/>
+  <circle cx="65" cy="52.5" r="5" fill="#F59E0B"/>
+  <polygon points="50,53 43,66 50,79 57,66" fill="#F59E0B"/>
+</svg>`
+
 const uiHTML = `<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProCam Radar — Инженерная система поиска и настройки IP-камер</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="shortcut icon" href="/favicon.svg">
 <style>
   :root {
     --bg: #FAFAFA;
@@ -2591,6 +2606,14 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(uiHTML))
+	})
+	http.HandleFunc("/favicon.svg", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		_, _ = w.Write([]byte(appIconSVG))
+	})
+	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		_, _ = w.Write([]byte(appIconSVG))
 	})
 	http.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		iface, ip, _ := getPrimaryInterface()
