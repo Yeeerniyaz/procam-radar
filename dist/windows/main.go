@@ -1921,6 +1921,49 @@ const uiHTML = `<!DOCTYPE html>
     white-space: pre-wrap;
   }
 
+  /* Application Footer & Author Bar */
+  .app-footer {
+    border-top: 1px solid var(--border);
+    background: #FFFFFF;
+    padding: 12px 24px;
+    margin-top: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .app-footer a {
+    color: inherit;
+    text-decoration: none;
+    transition: color 0.12s ease;
+  }
+  .app-footer a:hover {
+    color: var(--dark);
+    text-decoration: underline;
+  }
+  .footer-author-btn {
+    background: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: var(--emerald-dark);
+    font-size: 11.5px;
+    font-weight: 700;
+    padding: 5px 12px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .footer-author-btn:hover {
+    background: var(--emerald);
+    color: #FFFFFF;
+    border-color: var(--emerald);
+  }
+
   /* Modals */
   .modal-backdrop {
     position: fixed;
@@ -2229,7 +2272,124 @@ const uiHTML = `<!DOCTYPE html>
       <pre id="logBox">[ProCam Radar v4.0] Система готова. Одновременная работа Wi-Fi и Ethernet активна.</pre>
     </div>
 
+    <!-- Sleek Architectural Footer & Author Bar -->
+    <footer class="app-footer">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span class="status-dot dot-local"></span>
+        <span style="font-weight:700; color:var(--dark);">ProCam Radar v4.1</span>
+        <span>· Мульти-сетевой инженерный комплекс</span>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span>Автор и разработчик: <a href="https://yeee.kz" target="_blank" style="font-weight:700; color:var(--dark);">Ернияз</a> (<a href="https://yeee.kz" target="_blank" style="color:var(--emerald-dark); font-weight:600;">yeee.kz</a>)</span>
+        <span>·</span>
+        <a href="mailto:yeeerniyaz@gmail.com" class="mono" style="color:var(--muted);">yeeerniyaz@gmail.com</a>
+        <span>·</span>
+        <span class="mono">
+          <a href="tel:+77066066323">+7 (706) 606-63-23</a> · <a href="tel:+77766066323">+7 (776) 606-63-23</a>
+        </span>
+      </div>
+
+      <div>
+        <button class="footer-author-btn" onclick="openAuthorModal()">
+          <span>Все проекты & обо мне</span>
+          <span>↗</span>
+        </button>
+      </div>
+    </footer>
+
   </main>
+
+  <!-- Модальное окно: Автор и все проекты -->
+  <div class="modal-backdrop" id="authorModal" onclick="if(event.target===this)closeAuthorModal()">
+    <div class="modal-box" style="max-width:820px;">
+      <div class="modal-top">
+        <div>
+          <div class="eyebrow" style="color:var(--emerald-dark);">// АВТОР И ЭКОСИСТЕМА ПРОЕКТОВ</div>
+          <div class="modal-title" style="margin-top:2px;">Ернияз Талғатулы · Разработчик & Инженер</div>
+        </div>
+        <button class="btn" onclick="closeAuthorModal()">Закрыть</button>
+      </div>
+
+      <!-- Карточка автора -->
+      <div style="background:#18181B; border:1px solid #27272A; border-radius:14px; padding:16px 20px; color:#F4F4F5; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+        <div style="display:flex; align-items:center; gap:14px;">
+          <div style="width:52px; height:52px; border-radius:50%; background:linear-gradient(135deg, #10B981 0%, #059669 100%); display:flex; align-items:center; justify-content:center; color:#FFFFFF; font-weight:900; font-size:20px; box-shadow:0 4px 14px rgba(16, 185, 129, 0.4);">
+            Y
+          </div>
+          <div>
+            <div style="font-size:16px; font-weight:800; color:#FFFFFF;">Ернияз Талғатулы</div>
+            <div style="font-size:12px; color:#A1A1AA; margin-top:2px;">Инженер систем безопасности & Fullstack-разработчик · Алматы, Казахстан</div>
+            <div style="font-size:12px; margin-top:4px;">
+              <a href="https://yeee.kz" target="_blank" style="color:#34D399; font-weight:700; text-decoration:none;">yeee.kz</a>
+              <span style="color:#71717A;"> · </span>
+              <a href="mailto:yeeerniyaz@gmail.com" style="color:#D4D4D8; text-decoration:none;" class="mono">yeeerniyaz@gmail.com</a>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <a class="btn-wb btn-wb-primary" href="https://wa.me/77066066323" target="_blank" style="text-decoration:none; padding:7px 14px; font-size:12px;">WhatsApp</a>
+          <a class="btn-wb" href="https://t.me/yeeeerniyaz" target="_blank" style="text-decoration:none; padding:7px 14px; font-size:12px;">Telegram</a>
+        </div>
+      </div>
+
+      <!-- Список проектов -->
+      <div class="eyebrow" style="margin-bottom:8px;">// ВСЕ ПРОЕКТЫ И РАЗРАБОТКИ</div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:10px; margin-bottom:16px;">
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">ProCam CCTV</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">Монтаж IP-видеонаблюдения в Алматы (Hikvision, HiWatch, Dahua, PoE, ColorVu).</div>
+          <a href="https://procam.yeee.kz" target="_blank" style="display:inline-block; margin-top:8px; font-size:11.5px; color:var(--emerald-dark); font-weight:700; text-decoration:none;">procam.yeee.kz ↗</a>
+        </div>
+
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">ProCam Radar v4.1</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">Инженерный сканер по кабелю и Wi-Fi (/32), подбор свободных IP (1..245), PDF-паспорта.</div>
+          <span style="display:inline-block; margin-top:8px; font-size:11.5px; color:#71717A; font-weight:600;">Текущая программа</span>
+        </div>
+
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">ProCam Viewer</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">Клиентская станция видеонаблюдения, просмотр архива NVR с HDD и пакетная выгрузка.</div>
+          <a href="https://procam.yeee.kz/#procam-radar" target="_blank" style="display:inline-block; margin-top:8px; font-size:11.5px; color:var(--emerald-dark); font-weight:700; text-decoration:none;">Скачать ПО ↗</a>
+        </div>
+
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">Royal Banners (UKB)</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">Корпоративный портал и рекламная платформа наружной рекламы и полиграфии (royalbanners.yeee.kz).</div>
+          <a href="https://royalbanners.yeee.kz/" target="_blank" style="display:inline-block; margin-top:8px; font-size:11.5px; color:var(--emerald-dark); font-weight:700; text-decoration:none;">royalbanners.yeee.kz ↗</a>
+        </div>
+
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">TezTap Platform</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">SaaS-сервис для генерации страниц, визиток и микро-каталогов с заказами в WhatsApp.</div>
+          <span style="display:inline-block; margin-top:8px; font-size:11.5px; color:#71717A; font-weight:600;">Внутренняя разработка</span>
+        </div>
+
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">Justice Company</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">Минималистичный лендинг для юристов с интегрированной CMS и управлением через Telegram-бота.</div>
+          <span style="display:inline-block; margin-top:8px; font-size:11.5px; color:#71717A; font-weight:600;">Внутренняя разработка</span>
+        </div>
+
+        <div style="background:#FAFAFA; border:1px solid #E4E4E7; border-radius:12px; padding:12px 14px;">
+          <div style="font-weight:700; font-size:13px; color:var(--dark);">Smart Mirror VECTOR & IoT</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:2px;">Умные зеркала на React/Linux и промышленная автоматика Wiren Board (MQTT/Modbus).</div>
+          <span style="display:inline-block; margin-top:8px; font-size:11.5px; color:#71717A; font-weight:600;">Внутренняя разработка</span>
+        </div>
+      </div>
+
+      <!-- Контакты для связи -->
+      <div style="background:var(--surface-subtle); border:1px solid var(--border); border-radius:12px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div style="font-size:12px; color:var(--muted);">
+          <b>Телефоны:</b> <a href="tel:+77066066323" style="color:var(--dark); font-weight:700;">+7 (706) 606-63-23</a> · <a href="tel:+77766066323" style="color:var(--dark); font-weight:700;">+7 (776) 606-63-23</a>
+          <span style="margin:0 8px;">|</span>
+          <b>Email:</b> <a href="mailto:yeeerniyaz@gmail.com" style="color:var(--dark); font-weight:600;">yeeerniyaz@gmail.com</a>
+        </div>
+        <a class="btn btn-outline-emerald" href="https://yeee.kz" target="_blank" style="text-decoration:none; font-size:12px; padding:6px 14px;">Портфолио yeee.kz ↗</a>
+      </div>
+    </div>
+  </div>
 
   <!-- Модальное окно: Пакетная активация и разведение конфликтов -->
   <div class="modal-backdrop" id="activateModal" onclick="if(event.target===this)closeActivateModal()">
@@ -2294,6 +2454,14 @@ const uiHTML = `<!DOCTYPE html>
       <div class="help-item">
         <b>5. Паспорт камеры, Проверка кабеля и Инженерный калькулятор (HDD · PoE · Объектив)</b>
         Кнопка <b>«Паспорт камеры»</b> без пароля показывает статус активации и точность часов ONVIF. Кнопка <b>«Проверка кабеля и PoE»</b> тестирует линию пакетами 64B и 1472B (MTU 1500). Кнопка <b>«Калькулятор (HDD · PoE · Объектив)»</b> рассчитывает объем жесткого диска, мощность PoE-коммутатора, входящий поток NVR и угол обзора объектива (2.8 / 4 / 6 / 12 мм).
+      </div>
+      <div class="help-item">
+        <b>6. Разработчик комплекса, техническая поддержка и контакты</b>
+        Автор программы ProCam Radar: <b>Ернияз Талғатулы</b> (инженер систем безопасности и разработчик ПО).<br>
+        Контакты для связи, заявок и консультаций:<br>
+        • Телефон / WhatsApp: <a href="https://wa.me/77066066323" target="_blank" style="color:var(--emerald-dark); font-weight:700;">+7 (706) 606-63-23</a> · <a href="tel:+77766066323" style="color:var(--emerald-dark); font-weight:700;">+7 (776) 606-63-23</a><br>
+        • Email: <a href="mailto:yeeerniyaz@gmail.com" style="color:var(--dark); font-weight:600;">yeeerniyaz@gmail.com</a><br>
+        • Персональный сайт и все проекты: <a href="https://yeee.kz" target="_blank" style="color:var(--emerald-dark); font-weight:700; text-decoration:underline;">yeee.kz</a> (ProCam CCTV, ProCam Radar, ProCam Viewer, Royal Banners — royalbanners.yeee.kz, TezTap, Justice Company).
       </div>
     </div>
   </div>
@@ -2470,6 +2638,8 @@ function openCalcModal() {
   calcUpdate();
 }
 function closeCalcModal() { document.getElementById('calcModal').style.display = 'none'; }
+function openAuthorModal() { document.getElementById('authorModal').style.display = 'flex'; }
+function closeAuthorModal() { document.getElementById('authorModal').style.display = 'none'; }
 
 function setCalcTab(tab) {
   ['hdd', 'poe', 'lens'].forEach(k => {
