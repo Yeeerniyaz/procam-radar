@@ -1316,17 +1316,34 @@ func cleanupAndExit() {
 //go:embed icon.png
 var embeddedIconPNG []byte
 
-const appIconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
-  <rect width="100" height="100" rx="22" fill="#09090B"/>
-  <path d="M50 8 L88 26 L88 54 C88 76 50 92 50 92 C50 92 12 76 12 54 L12 26 Z" fill="#18181B" stroke="#F59E0B" stroke-width="4" stroke-linejoin="round"/>
-  <polygon points="50,15 32,33 50,27 68,33" fill="#0284C7" opacity="0.88"/>
-  <polygon points="18,22 36,33 23,46" fill="#F59E0B"/>
-  <polygon points="82,22 64,33 77,46" fill="#F59E0B"/>
-  <polygon points="21,45 45,45 48,60 25,60" fill="#09090B" stroke="#38BDF8" stroke-width="2.5"/>
-  <polygon points="79,45 55,45 52,60 75,60" fill="#09090B" stroke="#38BDF8" stroke-width="2.5"/>
-  <circle cx="35" cy="52.5" r="5" fill="#F59E0B"/>
-  <circle cx="65" cy="52.5" r="5" fill="#F59E0B"/>
-  <polygon points="50,53 43,66 50,79 57,66" fill="#F59E0B"/>
+const appIconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <radialGradient id="appHdrSweep" cx="32" cy="32" r="23" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10B981" stop-opacity="0.5"/>
+      <stop offset="60%" stop-color="#10B981" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="appHdrBeam" x1="32" y1="32" x2="48" y2="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34D399" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0.2"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="#09090B"/>
+  <rect x="1" y="1" width="62" height="62" rx="14" stroke="#27272A" stroke-width="1.2"/>
+  <circle cx="32" cy="32" r="23" fill="#0E131F" stroke="#27272A" stroke-width="1.8"/>
+  <circle cx="32" cy="32" r="17" stroke="#10B981" stroke-width="1" stroke-opacity="0.28" stroke-dasharray="3 2"/>
+  <circle cx="32" cy="32" r="11" stroke="#10B981" stroke-width="1.2" stroke-opacity="0.45"/>
+  <circle cx="32" cy="32" r="5" stroke="#10B981" stroke-width="1.2" stroke-opacity="0.6"/>
+  <line x1="9" y1="32" x2="55" y2="32" stroke="#27272A" stroke-width="1.2"/>
+  <line x1="32" y1="9" x2="32" y2="55" stroke="#27272A" stroke-width="1.2"/>
+  <path d="M32 32 L32 9 A23 23 0 0 1 48.26 15.74 Z" fill="url(#appHdrSweep)"/>
+  <line x1="32" y1="32" x2="48.26" y2="15.74" stroke="url(#appHdrBeam)" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="42" cy="22" r="2.8" fill="#10B981" fill-opacity="0.25"/>
+  <circle cx="42" cy="22" r="1.8" fill="#34D399"/>
+  <circle cx="23" cy="23" r="1.6" fill="#10B981"/>
+  <circle cx="25" cy="41" r="1.6" fill="#10B981"/>
+  <circle cx="32" cy="32" r="3" fill="#09090B" stroke="#FFFFFF" stroke-width="1.4"/>
+  <circle cx="32" cy="32" r="1.5" fill="#10B981"/>
 </svg>`
 
 const uiHTML = `<!DOCTYPE html>

@@ -1,0 +1,10 @@
+<svg width="260" height="56" viewBox="0 0 260 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  
+  <style>
+    .pro { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; letter-spacing: -0.03em; }
+    .cam { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 400; letter-spacing: -0.03em; }
+    .tag { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; letter-spacing: -0.02em; }
+    .sub { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+  </style>
+  <text x="130" y="40" text-anchor="middle" font-size="36"><tspan class="pro" fill="#09090B">PRO</tspan><tspan class="cam" fill="#52525B">CAM</tspan> <tspan class="tag" fill="#059669">RADAR</tspan></text>
+</svg>

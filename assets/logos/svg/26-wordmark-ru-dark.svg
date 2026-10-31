@@ -1,0 +1,11 @@
+<svg width="320" height="72" viewBox="0 0 320 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+  
+  <style>
+    .pro { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; letter-spacing: -0.03em; }
+    .cam { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 400; letter-spacing: -0.03em; }
+    .tag { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; letter-spacing: -0.02em; }
+    .sub { font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+  </style>
+  <text x="160" y="38" text-anchor="middle" font-size="32"><tspan class="pro" fill="#FFFFFF">PRO</tspan><tspan class="cam" fill="#A1A1AA">CAM</tspan> <tspan class="tag" fill="#10B981">RADAR</tspan></text>
+  <text x="160" y="58" text-anchor="middle" font-size="11.5" class="sub" fill="#A1A1AA">СЕТЕВОЙ СКАНЕР IP-КАМЕР</text>
+</svg>
