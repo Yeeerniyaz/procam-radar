@@ -2048,18 +2048,34 @@ const uiHTML = `<!DOCTYPE html>
   <header class="header">
     <div class="brand-group">
       <div class="logo-box">
-        <!-- CyberOwlMark SVG from ProCam -->
+        <!-- ProCam Radar Scope SVG Logo -->
         <svg width="42" height="42" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="hdrSweep" cx="32" cy="32" r="23" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#10B981" stop-opacity="0.5"/>
+              <stop offset="60%" stop-color="#10B981" stop-opacity="0.18"/>
+              <stop offset="100%" stop-color="#10B981" stop-opacity="0"/>
+            </radialGradient>
+            <linearGradient id="hdrBeam" x1="32" y1="32" x2="48" y2="16" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#34D399" stop-opacity="1"/>
+              <stop offset="100%" stop-color="#10B981" stop-opacity="0.2"/>
+            </linearGradient>
+          </defs>
           <rect width="64" height="64" rx="15" fill="#09090B"/>
-          <path d="M11 15L23 21L32 14L41 21L53 15L55 34C55 46.5 44.5 54.5 32 57C19.5 54.5 9 46.5 9 34L11 15Z" fill="#18181B" stroke="#E4E4E7" stroke-width="2" stroke-linejoin="round"/>
-          <path d="M13 21L32 31L51 21" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-          <circle cx="22" cy="34" r="7.5" fill="#09090B" stroke="#FFFFFF" stroke-width="2"/>
-          <circle cx="22" cy="34" r="3.5" fill="#09090B" stroke="#10B981" stroke-width="1.6"/>
-          <circle cx="23.5" cy="32.5" r="1.7" fill="#10B981"/>
-          <circle cx="42" cy="34" r="7.5" fill="#09090B" stroke="#FFFFFF" stroke-width="2"/>
-          <circle cx="42" cy="34" r="3.5" fill="#09090B" stroke="#10B981" stroke-width="1.6"/>
-          <circle cx="43.5" cy="32.5" r="1.7" fill="#10B981"/>
-          <path d="M32 37L28.5 44L32 50L35.5 44L32 37Z" fill="#E4E4E7"/>
+          <circle cx="32" cy="32" r="23" fill="#0E131F" stroke="#27272A" stroke-width="1.8"/>
+          <circle cx="32" cy="32" r="17" stroke="#10B981" stroke-width="1" stroke-opacity="0.28" stroke-dasharray="3 2"/>
+          <circle cx="32" cy="32" r="11" stroke="#10B981" stroke-width="1.2" stroke-opacity="0.45"/>
+          <circle cx="32" cy="32" r="5" stroke="#10B981" stroke-width="1.2" stroke-opacity="0.6"/>
+          <line x1="9" y1="32" x2="55" y2="32" stroke="#27272A" stroke-width="1.2"/>
+          <line x1="32" y1="9" x2="32" y2="55" stroke="#27272A" stroke-width="1.2"/>
+          <path d="M32 32 L32 9 A23 23 0 0 1 48.26 15.74 Z" fill="url(#hdrSweep)"/>
+          <line x1="32" y1="32" x2="48.26" y2="15.74" stroke="url(#hdrBeam)" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="42" cy="22" r="2.8" fill="#10B981" fill-opacity="0.25"/>
+          <circle cx="42" cy="22" r="1.8" fill="#34D399"/>
+          <circle cx="23" cy="23" r="1.6" fill="#10B981"/>
+          <circle cx="25" cy="41" r="1.6" fill="#10B981"/>
+          <circle cx="32" cy="32" r="3" fill="#09090B" stroke="#FFFFFF" stroke-width="1.4"/>
+          <circle cx="32" cy="32" r="1.5" fill="#10B981"/>
         </svg>
         <div>
           <div class="wordmark-main">PRO<span class="cam">CAM</span><span class="radar-pill">RADAR v4.1</span></div>
