@@ -4,3 +4,5 @@ cameras_audit_*.pdf
 cameras_audit_*.md
 snap_*.jpg
 .DS_Store
+node_modules
+dist/windows/web/

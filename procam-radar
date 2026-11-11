@@ -184,9 +184,16 @@ CAMERA_OUI_MAP = {
     "ec:c8:9c": "Hikvision / HiWatch",
     "f8:4d:fc": "Hikvision / HiWatch",
     "fc:9f:fd": "Hikvision / HiWatch",
+    "3c:da:6d": "Hikvision / OEM",
+    "3c:da:6e": "Hikvision / OEM",
 
     # Dahua / Imou
     "00:12:41": "Dahua",
+    "00:c0:7f": "Dahua / OEM",
+    "00:c0:81": "Dahua / OEM",
+    "00:c0:88": "Dahua / OEM",
+    "00:c0:89": "Dahua / OEM",
+    "e4:e6:6c": "IP-камера (Smart IPC)",
     "08:ed:ed": "Dahua",
     "14:a7:8b": "Dahua",
     "18:2a:7b": "Dahua",
@@ -821,7 +828,10 @@ def parse_xml_discovery_payload(raw_bytes: bytes) -> dict:
                 info["firmware"] = m_fw.group(1).strip()
 
         if "model" not in info and types_val:
-            info["model"] = types_val
+            if "networkvideotransmitter" not in types_val.lower() and "tds:device" not in types_val.lower():
+                info["model"] = types_val
+        if "model" in info and ("networkvideotransmitter" in info["model"].lower() or "tds:device" in info["model"].lower()):
+            del info["model"]
 
         if "vendor" not in info:
             low = text.lower()
@@ -2109,7 +2119,16 @@ def run_dump_report(fmt: str = "both") -> int:
     if os.path.exists(LAST_SCAN_CACHE):
         try:
             with open(LAST_SCAN_CACHE, "r", encoding="utf-8") as f:
-                scan_data = json.load(f)
+                raw_loaded = json.load(f)
+            if isinstance(raw_loaded, list):
+                scan_data = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "iface": "auto",
+                    "mode": "scan",
+                    "cameras": raw_loaded,
+                }
+            elif isinstance(raw_loaded, dict):
+                scan_data = raw_loaded
         except Exception:
             scan_data = None
 
@@ -2124,6 +2143,20 @@ def run_dump_report(fmt: str = "both") -> int:
             "mode": "no-prior-scan",
             "cameras": [],
         }
+
+    # Дедупликация камер перед формированием отчета
+    raw_cams = scan_data.get("cameras", [])
+    dedup_cams = []
+    seen_cam_keys = set()
+    for c in raw_cams:
+        c_ip = str(c.get("ip", "")).strip()
+        c_mac = str(c.get("mac", "")).strip().upper()
+        key = f"{c_ip}|{c_mac}"
+        if key in seen_cam_keys:
+            continue
+        seen_cam_keys.add(key)
+        dedup_cams.append(c)
+    scan_data["cameras"] = dedup_cams
 
     ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
     cameras = scan_data.get("cameras", [])
@@ -2924,7 +2957,13 @@ def run_radar_scan() -> int:
     stop_sniff.set()
 
     # Инъекция мостов :yeee на том интерфейсе, где ответила камера (без разрыва Wi-Fi!)
-    all_ips = sorted(nodes_by_ip.keys())
+    def _ip_sort_key(s: str):
+        try:
+            return tuple(int(p) for p in s.split("."))
+        except Exception:
+            return (999, 999, 999, 999)
+
+    all_ips = sorted(nodes_by_ip.keys(), key=_ip_sort_key)
     subnet_status_by_ip = {}
     for ip_str in all_ips:
         mac_dict = nodes_by_ip[ip_str]
