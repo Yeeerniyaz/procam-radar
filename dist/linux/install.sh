@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# ProCam Radar v4.0 — Автоматический установщик для Linux (Ubuntu / Debian / Arch)
+# ProCam Radar v5.0 — Автоматический установщик для Linux (Ubuntu / Debian / Arch)
 # Устанавливает основное приложение ProCamRadar_Linux_x64, иконку Кибер-Совы
 # и ярлык в меню приложений.
 # ==============================================================================
@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." 2>/dev/null && pwd || pwd)"
 
 echo "================================================================"
-echo "  Установка ProCam Radar v4.0 (Engineering Suite for Linux)"
+echo "  Установка ProCam Radar v5.0 (Desktop Suite for Linux)"
 echo "================================================================"
 
 if [[ $EUID -ne 0 ]]; then
@@ -80,7 +80,7 @@ gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 # 4. Ярлык в меню приложений (.desktop) — запускает ProCamRadar_Linux_x64
 cat > /usr/share/applications/procam-radar.desktop << 'EOF'
 [Desktop Entry]
-Version=4.0
+Version=5.0
 Type=Application
 Name=ProCam Radar
 GenericName=Поиск и диагностика IP-камер
@@ -93,10 +93,10 @@ StartupWMClass=ProCamRadar
 EOF
 chmod 0644 /usr/share/applications/procam-radar.desktop
 
-for id in ProCamRadar 127.0.0.1 crx__127_0_0_1 chrome-http___127.0.0.1_8765_-Default; do
+for id in procam-radar ProCamRadar 127.0.0.1 crx__127_0_0_1 chrome-http___127.0.0.1_8765_-Default; do
   cat > "/usr/share/applications/${id}.desktop" << EOF
 [Desktop Entry]
-Version=4.0
+Version=5.0
 Type=Application
 Name=ProCam Radar
 Exec=/usr/local/bin/ProCamRadar_Linux_x64
@@ -133,7 +133,7 @@ chmod 0644 /usr/share/applications/procam-run-binary.desktop
 update-desktop-database /usr/share/applications 2>/dev/null || true
 
 echo "================================================================"
-echo "  ✔ ProCam Radar v4.0 успешно установлен!"
+echo "  ✔ ProCam Radar v5.0 успешно установлен!"
 echo "  • Запуск из меню приложений:  ProCam Radar (с иконкой совы)"
 echo "  • Запуск из терминала:        ProCamRadar_Linux_x64"
 echo "================================================================"
